@@ -1,8 +1,9 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import os
+import shutil
 import platform
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Optional, Literal
 from pathlib import Path
 
@@ -15,9 +16,55 @@ from boltz.data.types import Manifest
 from boltz.main import download_boltz2, check_inputs, process_inputs, filter_inputs_structure
 from boltz.main import BoltzProcessedInput, PairformerArgsV2, MSAModuleArgs, Boltz2DiffusionParams, Boltz2InferenceDataModule, BoltzWriter, BoltzSteeringParams
 from boltz.model.models.boltz2 import Boltz2
+from design.models.boltzgo import BoltzGO
 
 from .logger import print_log
 
+
+
+@dataclass
+class DataUpdater:
+
+    out_dir: str
+    cache: str
+    use_msa_server: bool
+    msa_server_url: str
+    msa_pairing_strategy: str
+    msa_server_username: str
+    msa_server_password: str
+    api_key_header: str
+    api_key_value: str
+    preprocessing_threads: int
+    max_msa_seqs: int
+    
+    def __call__(self, data):
+        white_list = ['manifest.json']
+        processed_dir = os.path.join(self.out_dir, 'processed')
+        if os.path.exists(processed_dir):
+            for f in os.listdir(processed_dir):
+                if f in white_list: continue
+                shutil.rmtree(os.path.join(processed_dir, f))
+        # Process inputs
+        ccd_path = self.cache / "ccd.pkl"
+        mol_dir = self.cache / "mols"
+        process_inputs(
+            data=data,
+            out_dir=self.out_dir,
+            ccd_path=ccd_path,
+            mol_dir=mol_dir,
+            use_msa_server=self.use_msa_server,
+            msa_server_url=self.msa_server_url,
+            msa_pairing_strategy=self.msa_pairing_strategy,
+            msa_server_username=self.msa_server_username,
+            msa_server_password=self.msa_server_password,
+            api_key_header=self.api_key_header,
+            api_key_value=self.api_key_value,
+            boltz2=True,
+            preprocessing_threads=self.preprocessing_threads,
+            max_msa_seqs=self.max_msa_seqs,
+        )
+        manifest = Manifest.load(self.out_dir / "processed" / "manifest.json")
+        return manifest
 
 
 def prepare_boltz2(
@@ -114,11 +161,9 @@ def prepare_boltz2(
     # Process inputs
     ccd_path = cache / "ccd.pkl"
     mol_dir = cache / "mols"
-    process_inputs(
-        data=data,
+    data_updater = DataUpdater(
         out_dir=out_dir,
-        ccd_path=ccd_path,
-        mol_dir=mol_dir,
+        cache=cache,
         use_msa_server=use_msa_server,
         msa_server_url=msa_server_url,
         msa_pairing_strategy=msa_pairing_strategy,
@@ -126,10 +171,26 @@ def prepare_boltz2(
         msa_server_password=msa_server_password,
         api_key_header=api_key_header,
         api_key_value=api_key_value,
-        boltz2=True,
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
     )
+    data_updater(data)
+    # process_inputs(
+    #     data=data,
+    #     out_dir=out_dir,
+    #     ccd_path=ccd_path,
+    #     mol_dir=mol_dir,
+    #     use_msa_server=use_msa_server,
+    #     msa_server_url=msa_server_url,
+    #     msa_pairing_strategy=msa_pairing_strategy,
+    #     msa_server_username=msa_server_username,
+    #     msa_server_password=msa_server_password,
+    #     api_key_header=api_key_header,
+    #     api_key_value=api_key_value,
+    #     boltz2=True,
+    #     preprocessing_threads=preprocessing_threads,
+    #     max_msa_seqs=max_msa_seqs,
+    # )
 
     # Load manifest
     manifest = Manifest.load(out_dir / "processed" / "manifest.json")
@@ -210,6 +271,7 @@ def prepare_boltz2(
         accelerator=accelerator,
         devices=devices,
         precision="bf16-mixed",
+        inference_mode=False    # this is for gradient calculation
     )
 
     if filtered_manifest.records:
@@ -247,7 +309,7 @@ def prepare_boltz2(
         steering_args.fk_steering = use_potentials
         steering_args.physical_guidance_update = use_potentials
 
-        model_module = Boltz2.load_from_checkpoint(
+        model_module = BoltzGO.load_from_checkpoint(
             checkpoint,
             strict=True,
             predict_args=predict_args,
@@ -260,5 +322,6 @@ def prepare_boltz2(
             steering_args=asdict(steering_args),
         )
         model_module.eval()
+    else: return None, None, None, None
 
-    return trainer, model_module, data_module
+    return trainer, model_module, data_module, data_updater

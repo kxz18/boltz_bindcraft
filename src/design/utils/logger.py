@@ -4,6 +4,8 @@ import os
 import sys
 import datetime
 
+import torch
+
 
 LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 LEVELS_MAP = None
@@ -33,3 +35,9 @@ def print_log(s, level='INFO', end='\n', no_prefix=False):
             print(prefix, end='')
         print(s, end=end)
         sys.stdout.flush()
+
+# for torch cuda memory
+def cuda_memory_summary():
+    print("torch.cuda.memory_allocated: %fGB"%(torch.cuda.memory_allocated(0)/1024/1024/1024))
+    print("torch.cuda.memory_reserved: %fGB"%(torch.cuda.memory_reserved(0)/1024/1024/1024))
+    print("torch.cuda.max_memory_reserved: %fGB"%(torch.cuda.max_memory_reserved(0)/1024/1024/1024))

@@ -153,6 +153,13 @@ class PairformerModule(nn.Module):
                 ),
             )
 
+    def set_force_checkpointing(self):
+        self.force_checkpointing = True
+    
+    def get_force_checkpointing(self):
+        if hasattr(self, 'force_checkpointing'): return self.force_checkpointing
+        return False
+
     def forward(
         self,
         s: Tensor,
@@ -186,7 +193,7 @@ class PairformerModule(nn.Module):
             chunk_size_tri_attn = None
 
         for layer in self.layers:
-            if self.activation_checkpointing and self.training:
+            if (self.activation_checkpointing and self.training) or self.get_force_checkpointing():
                 s, z = torch.utils.checkpoint.checkpoint(
                     layer,
                     s,
@@ -195,6 +202,7 @@ class PairformerModule(nn.Module):
                     pair_mask,
                     chunk_size_tri_attn,
                     use_kernels,
+                    use_reentrant=not self.get_force_checkpointing()    # this is for gradient search
                 )
             else:
                 s, z = layer(s, z, mask, pair_mask, chunk_size_tri_attn, use_kernels)

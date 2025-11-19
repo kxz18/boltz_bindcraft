@@ -1,0 +1,774 @@
+#!/usr/bin/python
+# -*- coding:utf-8 -*-
+import gc
+from typing import Any, Optional, Literal
+
+import torch
+from torch import Tensor, nn
+
+from boltz.model.models.boltz2 import Boltz2
+from boltz.model.modules.trunkv2 import InputEmbedder
+from design.utils.logger import print_log, cuda_memory_summary
+
+from boltz.model.modules.diffusionv2 import *
+
+
+def get_detached_tensors(tensors):
+    detached = []
+    for t in tensors: detached.append(t.detach().requires_grad_(True))
+    return detached
+
+
+class InputEmbedderWrapper(nn.Module):
+    def __init__(
+            self,
+            input_embedder: InputEmbedder,
+            atom_embedding_mode: Literal['common', 'none', 'unk'] = 'none',
+        ):
+        super().__init__()
+        self.input_embedder = input_embedder
+        self.atom_embedding_mode = atom_embedding_mode
+
+    def forward(self, feats: dict[str, Tensor], affinity: bool = False) -> Tensor:
+        """Perform the forward pass.
+
+        Parameters
+        ----------
+        feats : dict[str, Tensor]
+            Input features
+
+        Returns
+        -------
+        Tensor
+            The embedded tokens.
+
+        """
+        # Load relevant features
+        # res_type = feats["res_type"].float()
+        res_type = feats["res_type"]
+        if affinity:
+            profile = feats["profile_affinity"]
+            deletion_mean = feats["deletion_mean_affinity"].unsqueeze(-1)
+        else:
+            profile = feats["profile"]
+            deletion_mean = feats["deletion_mean"].unsqueeze(-1)
+
+        # Compute input embedding
+        embedder = self.input_embedder
+        if self.atom_embedding_mode == 'none':
+            print_log(f'Setting atom features to zero', level='DEBUG')
+            a = 0
+        elif self.atom_embedding_mode == 'common':
+            q, c, p, to_keys = embedder.atom_encoder(feats)
+            atom_enc_bias = embedder.atom_enc_proj_z(p)
+            a, _, _, _ = embedder.atom_attention_encoder(
+                feats=feats,
+                q=q,
+                c=c,
+                atom_enc_bias=atom_enc_bias,
+                to_keys=to_keys,
+            )
+        else: raise NotImplementedError(f'atom embedding mode {self.atom_embedding_mode} not implemented')
+        s = (
+            a
+            + embedder.res_type_encoding(res_type)
+            + embedder.msa_profile_encoding(torch.cat([profile, deletion_mean], dim=-1))
+        )
+
+        # if embedder.add_method_conditioning:
+        #     s = s + embedder.method_conditioning_init(feats["method_feature"])
+        # if embedder.add_modified_flag:
+        #     s = s + embedder.modified_conditioning_init(feats["modified"])
+        # if embedder.add_cyclic_flag:
+        #     cyclic = feats["cyclic_period"].clamp(max=1.0).unsqueeze(-1)
+        #     s = s + embedder.cyclic_conditioning_init(cyclic)
+        # if embedder.add_mol_type_feat:
+        #     s = s + embedder.mol_type_conditioning_init(feats["mol_type"])
+
+        return s
+
+
+class BoltzGO(Boltz2):  # boltz with gradient optimization
+
+    def setup_config(
+        self,
+        atom_embedding_mode: Literal['common', 'none', 'unk'] = 'common',
+    ):
+        self.input_embedder_wrapper = InputEmbedderWrapper(self.input_embedder, atom_embedding_mode)
+        self.confidence_module.pairformer_stack.set_force_checkpointing()
+
+    def enable_param_gradients(self, mode: bool=True):
+        for name, p in self.named_parameters():
+            p.requires_grad_(mode)
+
+    def get_loss(self, dict_out: str):
+        loss = (1 - (dict_out['iptm'] / 100)) + (1 - dict_out['plddt']).mean() # minimize loss
+        return loss
+
+    def _diffusion_sample(
+        self,
+        atom_mask,
+        num_sampling_steps=None,
+        multiplicity=1,
+        max_parallel_samples=None,
+        steering_args=None,
+        **network_condition_kwargs,
+    ):
+        self = self.structure_module    # hack the codes
+
+        if steering_args is not None and (
+            steering_args["fk_steering"]
+            or steering_args["physical_guidance_update"]
+            or steering_args["contact_guidance_update"]
+        ):
+            potentials = get_potentials(steering_args, boltz2=True)
+
+        if steering_args["fk_steering"]:
+            multiplicity = multiplicity * steering_args["num_particles"]
+            energy_traj = torch.empty((multiplicity, 0), device=self.device)
+            resample_weights = torch.ones(multiplicity, device=self.device).reshape(
+                -1, steering_args["num_particles"]
+            )
+        if (
+            steering_args["physical_guidance_update"]
+            or steering_args["contact_guidance_update"]
+        ):
+            scaled_guidance_update = torch.zeros(
+                (multiplicity, *atom_mask.shape[1:], 3),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        if max_parallel_samples is None:
+            max_parallel_samples = multiplicity
+
+        num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
+        atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
+
+        shape = (*atom_mask.shape, 3)
+
+        # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
+        sigmas = self.sample_schedule(num_sampling_steps)
+        gammas = torch.where(sigmas > self.gamma_min, self.gamma_0, 0.0)
+        sigmas_and_gammas = list(zip(sigmas[:-1], sigmas[1:], gammas[1:]))
+        step_scale = self.step_scale
+
+        # atom position is noise at the beginning
+        init_sigma = sigmas[0]
+        atom_coords = init_sigma * torch.randn(shape, device=self.device)
+        token_repr = None
+        atom_coords_denoised = None
+
+        # gradually denoise
+        for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
+            random_R, random_tr = compute_random_augmentation(
+                multiplicity, device=atom_coords.device, dtype=atom_coords.dtype
+            )
+            atom_coords = atom_coords - atom_coords.mean(dim=-2, keepdims=True)
+            atom_coords = (
+                torch.einsum("bmd,bds->bms", atom_coords, random_R) + random_tr
+            )
+            if atom_coords_denoised is not None:
+                atom_coords_denoised -= atom_coords_denoised.mean(dim=-2, keepdims=True)
+                atom_coords_denoised = (
+                    torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
+                    + random_tr
+                )
+            if (
+                steering_args["physical_guidance_update"]
+                or steering_args["contact_guidance_update"]
+            ) and scaled_guidance_update is not None:
+                scaled_guidance_update = torch.einsum(
+                    "bmd,bds->bms", scaled_guidance_update, random_R
+                )
+
+            sigma_tm, sigma_t, gamma = sigma_tm.item(), sigma_t.item(), gamma.item()
+
+            t_hat = sigma_tm * (1 + gamma)
+            steering_t = 1.0 - (step_idx / num_sampling_steps)
+            noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
+            eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+            atom_coords_noisy = atom_coords + eps
+
+            # with torch.no_grad():
+            atom_coords_denoised = torch.zeros_like(atom_coords_noisy)
+            sample_ids = torch.arange(multiplicity).to(atom_coords_noisy.device)
+            sample_ids_chunks = sample_ids.chunk(
+                multiplicity % max_parallel_samples + 1
+            )
+
+            for sample_ids_chunk in sample_ids_chunks:
+                atom_coords_denoised_chunk = self.preconditioned_network_forward(
+                    atom_coords_noisy[sample_ids_chunk],
+                    t_hat,
+                    network_condition_kwargs=dict(
+                        multiplicity=sample_ids_chunk.numel(),
+                        **network_condition_kwargs,
+                    ),
+                )
+                atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+            if steering_args["fk_steering"] and (
+                (
+                    step_idx % steering_args["fk_resampling_interval"] == 0
+                    and noise_var > 0
+                )
+                or step_idx == num_sampling_steps - 1
+            ):
+                # Compute energy of x_0 prediction
+                energy = torch.zeros(multiplicity, device=self.device)
+                for potential in potentials:
+                    parameters = potential.compute_parameters(steering_t)
+                    if parameters["resampling_weight"] > 0:
+                        component_energy = potential.compute(
+                            atom_coords_denoised,
+                            network_condition_kwargs["feats"],
+                            parameters,
+                        )
+                        energy += parameters["resampling_weight"] * component_energy
+                energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
+
+                # Compute log G values
+                if step_idx == 0:
+                    log_G = -1 * energy
+                else:
+                    log_G = energy_traj[:, -2] - energy_traj[:, -1]
+
+                # Compute ll difference between guided and unguided transition distribution
+                if (
+                    steering_args["physical_guidance_update"]
+                    or steering_args["contact_guidance_update"]
+                ) and noise_var > 0:
+                    ll_difference = (
+                        eps**2 - (eps + scaled_guidance_update) ** 2
+                    ).sum(dim=(-1, -2)) / (2 * noise_var)
+                else:
+                    ll_difference = torch.zeros_like(energy)
+
+                # Compute resampling weights
+                resample_weights = F.softmax(
+                    (ll_difference + steering_args["fk_lambda"] * log_G).reshape(
+                        -1, steering_args["num_particles"]
+                    ),
+                    dim=1,
+                )
+
+            # Compute guidance update to x_0 prediction
+            if (
+                steering_args["physical_guidance_update"]
+                or steering_args["contact_guidance_update"]
+            ) and step_idx < num_sampling_steps - 1:
+                guidance_update = torch.zeros_like(atom_coords_denoised)
+                for guidance_step in range(steering_args["num_gd_steps"]):
+                    energy_gradient = torch.zeros_like(atom_coords_denoised)
+                    for potential in potentials:
+                        parameters = potential.compute_parameters(steering_t)
+                        if (
+                            parameters["guidance_weight"] > 0
+                            and (guidance_step) % parameters["guidance_interval"]
+                            == 0
+                        ):
+                            energy_gradient += parameters[
+                                "guidance_weight"
+                            ] * potential.compute_gradient(
+                                atom_coords_denoised + guidance_update,
+                                network_condition_kwargs["feats"],
+                                parameters,
+                            )
+                    guidance_update -= energy_gradient
+                atom_coords_denoised += guidance_update
+                scaled_guidance_update = (
+                    guidance_update
+                    * -1
+                    * self.step_scale
+                    * (sigma_t - t_hat)
+                    / t_hat
+                )
+
+            if steering_args["fk_steering"] and (
+                (
+                    step_idx % steering_args["fk_resampling_interval"] == 0
+                    and noise_var > 0
+                )
+                or step_idx == num_sampling_steps - 1
+            ):
+                resample_indices = (
+                    torch.multinomial(
+                        resample_weights,
+                        resample_weights.shape[1]
+                        if step_idx < num_sampling_steps - 1
+                        else 1,
+                        replacement=True,
+                    )
+                    + resample_weights.shape[1]
+                    * torch.arange(
+                        resample_weights.shape[0], device=resample_weights.device
+                    ).unsqueeze(-1)
+                ).flatten()
+
+                atom_coords = atom_coords[resample_indices]
+                atom_coords_noisy = atom_coords_noisy[resample_indices]
+                atom_mask = atom_mask[resample_indices]
+                if atom_coords_denoised is not None:
+                    atom_coords_denoised = atom_coords_denoised[resample_indices]
+                energy_traj = energy_traj[resample_indices]
+                if (
+                    steering_args["physical_guidance_update"]
+                    or steering_args["contact_guidance_update"]
+                ):
+                    scaled_guidance_update = scaled_guidance_update[
+                        resample_indices
+                    ]
+                if token_repr is not None:
+                    token_repr = token_repr[resample_indices]
+
+            if self.alignment_reverse_diff:
+                with torch.autocast("cuda", enabled=False):
+                    atom_coords_noisy = weighted_rigid_align(
+                        atom_coords_noisy.float(),
+                        atom_coords_denoised.float(),
+                        atom_mask.float(),
+                        atom_mask.float(),
+                    )
+
+                atom_coords_noisy = atom_coords_noisy.to(atom_coords_denoised)
+
+            denoised_over_sigma = (atom_coords_noisy - atom_coords_denoised) / t_hat
+            atom_coords_next = (
+                atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
+            )
+
+            atom_coords = atom_coords_next
+
+        return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
+
+    def _encode(
+        self,      
+        feats: dict[str, Tensor],
+        recycling_steps: int = 0,
+    ):
+        s_inputs = self.input_embedder_wrapper(feats)   # using the wrapper
+        print('after s_inputs')
+        cuda_memory_summary()
+        # Initialize the sequence embeddings
+        s_init = self.s_init(s_inputs)
+        print('after s_init')
+        cuda_memory_summary()
+
+        # Initialize pairwise embeddings
+        z_init = (
+            self.z_init_1(s_inputs)[:, :, None]
+            + self.z_init_2(s_inputs)[:, None, :]
+        )
+        print('after z_init')
+        cuda_memory_summary()
+        relative_position_encoding = self.rel_pos(feats)
+        print('after rel pos')
+        cuda_memory_summary()
+        z_init = z_init + relative_position_encoding
+        z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+        if self.bond_type_feature:  # default True
+            z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
+        z_init = z_init + self.contact_conditioning(feats)
+
+        # Perform rounds of the pairwise stack
+        s = torch.zeros_like(s_init)
+        z = torch.zeros_like(z_init)
+
+        # Compute pairwise mask
+        mask = feats["token_pad_mask"].float()
+        pair_mask = mask[:, :, None] * mask[:, None, :]
+        if self.run_trunk_and_structure:    # default True
+            print('starting recycling')
+            cuda_memory_summary()
+            for i in range(recycling_steps + 1):
+                print_log(f'entering recycling {i}')
+                # Apply recycling
+                s = s_init + self.s_recycle(self.s_norm(s))
+                z = z_init + self.z_recycle(self.z_norm(z))
+                print(f'recycle {i}')
+                cuda_memory_summary()
+
+                # Compute pairwise stack
+                if self.use_templates:  # default True
+                    if self.is_template_compiled and not self.training:
+                        template_module = self.template_module._orig_mod  # noqa: SLF001
+                    else:
+                        template_module = self.template_module
+
+                    z = z + template_module(
+                        z, feats, pair_mask, use_kernels=self.use_kernels
+                    )
+                print(f'templates {i}')
+                cuda_memory_summary()
+                if self.is_msa_compiled and not self.training:
+                    msa_module = self.msa_module._orig_mod  # noqa: SLF001
+                else:   # default this branch
+                    msa_module = self.msa_module
+
+                z = z + msa_module(
+                    z, s_inputs, feats, use_kernels=self.use_kernels
+                )
+                print(f'msa {i}')
+                cuda_memory_summary()
+
+                # Revert to uncompiled version for validation
+                if self.is_pairformer_compiled and not self.training:
+                    pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                else:   # default this branch
+                    pairformer_module = self.pairformer_module
+                s, z = torch.utils.checkpoint.checkpoint(
+                    pairformer_module, s, z, mask, pair_mask, self.use_kernels, use_reentrant=False
+                )
+                # s, z = pairformer_module(
+                #     s,
+                #     z,
+                #     mask=mask,
+                #     pair_mask=pair_mask,
+                #     use_kernels=self.use_kernels,
+                # )
+                print(f'pairformer {i}')
+                cuda_memory_summary()
+
+        pdistogram = self.distogram_module(z)
+        print('distogram')
+        cuda_memory_summary()
+        dict_out = {
+            "pdistogram": pdistogram,
+            "s": s,
+            "z": z,
+        }
+
+        if (
+            self.run_trunk_and_structure
+            and ((not self.training) or self.confidence_prediction)
+            and (not self.skip_run_structure)
+        ):  # default True
+            q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
+                self.diffusion_conditioning(
+                    s_trunk=s,
+                    z_trunk=z,
+                    relative_position_encoding=relative_position_encoding,
+                    feats=feats,
+                )
+            )
+            diffusion_conditioning = {
+                "q": q,
+                "c": c,
+                "to_keys": to_keys,
+                "atom_enc_bias": atom_enc_bias,
+                "atom_dec_bias": atom_dec_bias,
+                "token_trans_bias": token_trans_bias,
+            }
+        return s_inputs, dict_out, diffusion_conditioning
+
+    def _confidence(
+            self,
+            s_inputs,   # [1, N, 384]
+            s,          # [1, N, 384]
+            z,          # [1, N, N, 128]
+            pdistogram, # [1, N, N, 1, 64]
+            atom_coords,# [1, M, 3]
+            feats: dict,
+            diffusion_samples: int = 1,
+            run_confidence_sequentially: bool = False,
+        ) -> dict:
+        return self.confidence_module(
+            s_inputs=s_inputs,
+            s=s,
+            z=z,
+            x_pred=(
+                atom_coords
+                if not self.skip_run_structure
+                else feats["coords"].repeat_interleave(diffusion_samples, 0)
+            ),
+            feats=feats,
+            pred_distogram_logits=(
+                pdistogram[
+                    :, :, :, 0
+                ]  # TODO only implemented for 1 distogram
+            ),
+            multiplicity=diffusion_samples,
+            run_sequentially=run_confidence_sequentially,
+            use_kernels=self.use_kernels,
+        )
+    
+    def forward(
+        self,
+        feats: dict[str, Tensor],
+        recycling_steps: int = 0,
+        num_sampling_steps: Optional[int] = None,
+        multiplicity_diffusion_train: int = 1,
+        diffusion_samples: int = 1,
+        max_parallel_samples: Optional[int] = None,
+        run_confidence_sequentially: bool = False,
+    ) -> dict[str, Tensor]:
+
+        feats['res_type'] = feats['res_type'].float()
+        for k, v in feats.items():
+            if isinstance(v, torch.Tensor) and (v.dtype.is_floating_point or v.is_complex()):
+                v.requires_grad_(True)
+        res_type = feats['res_type']    # this is the logits of residues
+        with torch.no_grad():
+            s_inputs, dict_out, diffusion_conditioning = self._encode(feats, recycling_steps)
+            s, z, pdistogram = dict_out['s'], dict_out['z'], dict_out['pdistogram']
+            with torch.autocast("cuda", enabled=False):
+                struct_out = self._diffusion_sample(
+                    s_trunk=s.float(),
+                    s_inputs=s_inputs.float(),
+                    feats=feats,
+                    num_sampling_steps=num_sampling_steps,
+                    atom_mask=feats["atom_pad_mask"].float(),
+                    multiplicity=diffusion_samples,
+                    max_parallel_samples=max_parallel_samples,
+                    steering_args=self.steering_args,
+                    diffusion_conditioning=diffusion_conditioning,
+                )
+                dict_out.update(struct_out)
+        
+        atom_coords, s_inputs, s, z, pdistogram, res_type = get_detached_tensors([dict_out['sample_atom_coords'], s_inputs, s, z, pdistogram, res_type])
+        feats['res_type'] = res_type
+        with torch.set_grad_enabled(True):
+            _use_kernels = self.use_kernels
+            self.use_kernels = False
+            dict_out.update(self._confidence(s_inputs, s, z, pdistogram, atom_coords, feats, diffusion_samples, run_confidence_sequentially))
+            self.use_kernels = _use_kernels
+            loss = self.get_loss(dict_out)
+            dx, ds_inputs, ds, dz, dd, dres_type = torch.autograd.grad(loss, [atom_coords, s_inputs, s, z, pdistogram, res_type], retain_graph=False, allow_unused=True)
+            cuda_memory_summary()
+        
+        # set gradients
+        dict_out['gradient'] = None
+        
+        return dict_out
+
+        with torch.set_grad_enabled(False):
+            s_inputs = self.input_embedder_wrapper(feats)   # using the wrapper
+
+            # Initialize the sequence embeddings
+            s_init = self.s_init(s_inputs)
+
+            # Initialize pairwise embeddings
+            z_init = (
+                self.z_init_1(s_inputs)[:, :, None]
+                + self.z_init_2(s_inputs)[:, None, :]
+            )
+            relative_position_encoding = self.rel_pos(feats)
+            z_init = z_init + relative_position_encoding
+            z_init = z_init + self.token_bonds(feats["token_bonds"].float())
+            if self.bond_type_feature:  # default True
+                z_init = z_init + self.token_bonds_type(feats["type_bonds"].long())
+            z_init = z_init + self.contact_conditioning(feats)
+
+            # Perform rounds of the pairwise stack
+            s = torch.zeros_like(s_init)
+            z = torch.zeros_like(z_init)
+
+            # Compute pairwise mask
+            mask = feats["token_pad_mask"].float()
+            pair_mask = mask[:, :, None] * mask[:, None, :]
+            if self.run_trunk_and_structure:    # default True
+                for i in range(recycling_steps + 1):
+                    with torch.set_grad_enabled(True):
+                        # # Issue with unused parameters in autocast
+                        # if (
+                        #     self.training
+                        #     and (i == recycling_steps)
+                        #     and torch.is_autocast_enabled()
+                        # ):  # not sure whether this is needed
+                        #     torch.clear_autocast_cache()
+
+                        # Apply recycling
+                        s = s_init + self.s_recycle(self.s_norm(s))
+                        z = z_init + self.z_recycle(self.z_norm(z))
+
+                        # Compute pairwise stack
+                        if self.use_templates:  # default True
+                            if self.is_template_compiled and not self.training:
+                                template_module = self.template_module._orig_mod  # noqa: SLF001
+                            else:
+                                template_module = self.template_module
+
+                            z = z + template_module(
+                                z, feats, pair_mask, use_kernels=self.use_kernels
+                            )
+
+                        if self.is_msa_compiled and not self.training:
+                            msa_module = self.msa_module._orig_mod  # noqa: SLF001
+                        else:   # default this branch
+                            msa_module = self.msa_module
+
+                        z = z + msa_module(
+                            z, s_inputs, feats, use_kernels=self.use_kernels
+                        )
+
+                        # Revert to uncompiled version for validation
+                        if self.is_pairformer_compiled and not self.training:
+                            print('pairformer compiled on')
+                            pairformer_module = self.pairformer_module._orig_mod  # noqa: SLF001
+                        else:   # default this branch
+                            pairformer_module = self.pairformer_module
+
+                        s, z = pairformer_module(
+                            s,
+                            z,
+                            mask=mask,
+                            pair_mask=pair_mask,
+                            use_kernels=self.use_kernels,
+                        )
+
+            pdistogram = self.distogram_module(z)
+            dict_out = {
+                "pdistogram": pdistogram,
+                "s": s,
+                "z": z,
+            }
+
+            if (
+                self.run_trunk_and_structure
+                and ((not self.training) or self.confidence_prediction)
+                and (not self.skip_run_structure)
+            ):  # default True
+                q, c, to_keys, atom_enc_bias, atom_dec_bias, token_trans_bias = (
+                    self.diffusion_conditioning(
+                        s_trunk=s,
+                        z_trunk=z,
+                        relative_position_encoding=relative_position_encoding,
+                        feats=feats,
+                    )
+                )
+                diffusion_conditioning = {
+                    "q": q,
+                    "c": c,
+                    "to_keys": to_keys,
+                    "atom_enc_bias": atom_enc_bias,
+                    "atom_dec_bias": atom_dec_bias,
+                    "token_trans_bias": token_trans_bias,
+                }
+
+                with torch.autocast("cuda", enabled=False):
+                    struct_out = self._diffusion_sample(
+                        s_trunk=s.float(),
+                        s_inputs=s_inputs.float(),
+                        feats=feats,
+                        num_sampling_steps=num_sampling_steps,
+                        atom_mask=feats["atom_pad_mask"].float(),
+                        multiplicity=diffusion_samples,
+                        max_parallel_samples=max_parallel_samples,
+                        steering_args=self.steering_args,
+                        diffusion_conditioning=diffusion_conditioning,
+                    )
+                    dict_out.update(struct_out)
+
+                if self.predict_bfactor:    # default True
+                    pbfactor = self.bfactor_module(s)
+                    dict_out["pbfactor"] = pbfactor
+
+        if self.confidence_prediction:  # Default True
+            dict_out.update(
+                self.confidence_module(
+                    s_inputs=s_inputs.detach(),
+                    s=s.detach(),
+                    z=z.detach(),
+                    x_pred=(
+                        dict_out["sample_atom_coords"].detach()
+                        if not self.skip_run_structure
+                        else feats["coords"].repeat_interleave(diffusion_samples, 0)
+                    ),
+                    feats=feats,
+                    pred_distogram_logits=(
+                        dict_out["pdistogram"][
+                            :, :, :, 0
+                        ].detach()  # TODO only implemented for 1 distogram
+                    ),
+                    multiplicity=diffusion_samples,
+                    run_sequentially=run_confidence_sequentially,
+                    use_kernels=self.use_kernels,
+                )
+            )
+
+        # set gradients
+        dict_out['gradient'] = None
+        
+        return dict_out
+
+    def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> dict:
+        '''
+            will call forward and process the results
+        '''
+        try:
+            with torch.set_grad_enabled(False):
+                out = self(
+                    batch,
+                    recycling_steps=self.predict_args["recycling_steps"],
+                    num_sampling_steps=self.predict_args["sampling_steps"],
+                    diffusion_samples=self.predict_args["diffusion_samples"],
+                    max_parallel_samples=self.predict_args["max_parallel_samples"],
+                    run_confidence_sequentially=True,
+                )
+            pred_dict = {"exception": False}
+            if "keys_dict_batch" in self.predict_args:
+                for key in self.predict_args["keys_dict_batch"]:
+                    pred_dict[key] = batch[key]
+
+            pred_dict["masks"] = batch["atom_pad_mask"]
+            pred_dict["token_masks"] = batch["token_pad_mask"]
+            pred_dict["s"] = out["s"]
+            pred_dict["z"] = out["z"]
+
+            if "keys_dict_out" in self.predict_args:
+                for key in self.predict_args["keys_dict_out"]:
+                    pred_dict[key] = out[key]
+            pred_dict["coords"] = out["sample_atom_coords"]
+            if self.confidence_prediction:
+                # pred_dict["confidence"] = out.get("ablation_confidence", None)
+                pred_dict["pde"] = out["pde"]
+                pred_dict["plddt"] = out["plddt"]
+                pred_dict["confidence_score"] = (
+                    4 * out["complex_plddt"]
+                    + (
+                        out["iptm"]
+                        if not torch.allclose(
+                            out["iptm"], torch.zeros_like(out["iptm"])
+                        )
+                        else out["ptm"]
+                    )
+                ) / 5
+
+                pred_dict["complex_plddt"] = out["complex_plddt"]
+                pred_dict["complex_iplddt"] = out["complex_iplddt"]
+                pred_dict["complex_pde"] = out["complex_pde"]
+                pred_dict["complex_ipde"] = out["complex_ipde"]
+                if self.alpha_pae > 0:
+                    pred_dict["pae"] = out["pae"]
+                    pred_dict["ptm"] = out["ptm"]
+                    pred_dict["iptm"] = out["iptm"]
+                    pred_dict["ligand_iptm"] = out["ligand_iptm"]
+                    pred_dict["protein_iptm"] = out["protein_iptm"]
+                    pred_dict["pair_chains_iptm"] = out["pair_chains_iptm"]
+            if self.affinity_prediction:
+                pred_dict["affinity_pred_value"] = out["affinity_pred_value"]
+                pred_dict["affinity_probability_binary"] = out[
+                    "affinity_probability_binary"
+                ]
+                if self.affinity_ensemble:
+                    pred_dict["affinity_pred_value1"] = out["affinity_pred_value1"]
+                    pred_dict["affinity_probability_binary1"] = out[
+                        "affinity_probability_binary1"
+                    ]
+                    pred_dict["affinity_pred_value2"] = out["affinity_pred_value2"]
+                    pred_dict["affinity_probability_binary2"] = out[
+                        "affinity_probability_binary2"
+                    ]
+
+            # TODO: we can add our things here
+            pred_dict['gradient'] = out['gradient']
+            return pred_dict
+
+        except RuntimeError as e:  # catch out of memory exceptions
+            if "out of memory" in str(e):
+                print("| WARNING: ran out of memory, skipping batch")
+                torch.cuda.empty_cache()
+                gc.collect()
+                return {"exception": True}
+            else:
+                raise e
