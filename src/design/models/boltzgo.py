@@ -1,16 +1,21 @@
 #!/usr/bin/python
 # -*- coding:utf-8 -*-
 import gc
+import time
+from dataclasses import dataclass
 from typing import Any, Optional, Literal
 
+import yaml
 import torch
 from torch import Tensor, nn
 
 from boltz.model.models.boltz2 import Boltz2
 from boltz.model.modules.trunkv2 import InputEmbedder
-from design.utils.logger import print_log, cuda_memory_summary
-
+from boltz.data.const import tokens, prot_token_to_letter
 from boltz.model.modules.diffusionv2 import *
+
+from design.utils.logger import print_log, cuda_memory_summary
+from .loss import parse_losses
 
 
 def get_detached_tensors(tensors):
@@ -19,11 +24,23 @@ def get_detached_tensors(tensors):
     return detached
 
 
-def normalize_prob(p):
-    return torch.softmax(p, dim=-1)
-    p = p - p.min(-1, keepdims=True)[0]
-    p = p / p.sum(-1, keepdims=True)
+def expand_like(src, tgt):
+    src = src.reshape(*src.shape, *[1 for _ in tgt.shape[len(src.shape):]]) # [..., 1, 1, ...]
+    return src.expand_as(tgt)
+
+
+def normalize_prob(p, m):
+    m = expand_like(m.to(p.device), p)
+    p = torch.where(m, torch.softmax(p, dim=-1), p)
     return p
+
+
+def logits_to_types(logits, generate_mask):
+    mask = [(0 if ((name not in prot_token_to_letter) or (name == 'UNK') or (name == '-')) else 1) for name in tokens]
+    mask = torch.tensor(mask, dtype=bool, device=logits.device)
+    logits = logits.masked_fill(~mask[None, None, :], float('-inf'))
+    index = torch.argmax(logits, dim=-1)    # you can adjust strategies here
+    return [prot_token_to_letter[tokens[i]] for i in index[0]]
 
 
 class InputEmbedderWrapper(nn.Module):
@@ -95,31 +112,62 @@ class InputEmbedderWrapper(nn.Module):
         return s
 
 
+@dataclass
+class BoltzGOConfig:
+    max_inner_steps: int = 10
+    max_outer_steps: int = 100
+    inner_diffusion_steps: Optional[int] = None # if none, use the default in Boltz2
+
+    init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
+    init_offset: float = 3.0    # offset for the initial logits
+
+
 class BoltzGO(Boltz2):  # boltz with gradient optimization
 
     def setup_config(
         self,
+        yaml_path: str,
         atom_embedding_mode: Literal['common', 'none', 'unk'] = 'common',
     ):# otherwise backward through pairformer will throw errors
+        # basics
+        self.is_generation = True  # do structure prediction or generation
         self.input_embedder_wrapper = InputEmbedderWrapper(self.input_embedder, atom_embedding_mode)
         self.confidence_module.pairformer_stack.set_force_checkpointing()
         self.pairformer_module.set_force_checkpointing()
         self.use_kernels = False    # otherwise backward through pairformer will throw errors
 
+        # generation-related
+        with open(yaml_path, 'r') as fin: config = yaml.safe_load(fin)
+        self.generator_config = BoltzGOConfig(**config['generator']['config'])
+        self.losses = parse_losses(config['generator']['loss']) 
+
+        # generate mask
+        self.masks = []
+        masks = config['generator']['masks']
+        for seq in config['sequences']:
+            chain_id = seq['protein']['id']
+            if chain_id not in masks: self.masks.extend([False for _ in seq['protein']['sequence']])
+            else: self.masks.extend([(False if c == '0' else True) for c in masks[chain_id]])
+        self.masks = torch.tensor(self.masks, dtype=bool, device=self.structure_module.device)[None, :] # batch size = 1
+
         # dynamic recording variables
         self._traj = []
+
+    def set_mode_generation(self, is_generation: bool=True):
+        self.is_generation = is_generation
 
     def enable_param_gradients(self, mode: bool=True):
         for name, p in self.named_parameters():
             p.requires_grad_(mode)
 
     def get_loss(self, dict_out: str):
-        loss = (1 - (dict_out['iptm'] / 100)) + (1 - dict_out['plddt']).mean() # minimize loss
-        loss_details = {
-            'total': loss.item(),
-            'iptm': dict_out['iptm'].item(),
-            'plddt': dict_out['plddt'].mean().item()
-        }
+        loss, loss_details = 0, {}
+        for name in self.losses:
+            w, loss_cls = self.losses[name]
+            l, v = loss_cls(dict_out, self.masks)
+            loss += w * l
+            loss_details[name] = v
+        loss_details['total'] = loss.item()
         return loss, loss_details
 
     def _diffusion_one_step(
@@ -141,13 +189,14 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         eps=None,
         # local variables
         scaled_guidance_update=None,
+        potentials=None,
+        energy_traj=None,
+        resample_weights=None,
         **network_condition_kwargs, # s_trunk, s_inputs, feats (only variables without grads will be used), diffusion_conditioning
                                     # diffusion conditioning: q, c, to_keys(a function), atom_enc_bias, atom_dec_bias, token_trans_bias
     ):
         
-        self = self.structure_module
-
-        step_scale = self.step_scale
+        step_scale = self.structure_module.step_scale
         shape = (*atom_mask.shape, 3)
 
         if random_aug is None:
@@ -165,7 +214,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         #         torch.einsum("bmd,bds->bms", atom_coords_denoised, random_R)
         #         + random_tr
         #     )
-        if (
+        if (not self.is_generation) and (
             steering_args["physical_guidance_update"]
             or steering_args["contact_guidance_update"]
         ) and scaled_guidance_update is not None:
@@ -177,8 +226,8 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
 
         t_hat = sigma_tm * (1 + gamma)
         steering_t = 1.0 - (step_idx / num_sampling_steps)
-        noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
-        if eps is None: eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+        noise_var = self.structure_module.noise_scale**2 * (t_hat**2 - sigma_tm**2)
+        if eps is None: eps = sqrt(noise_var) * torch.randn(shape, device=self.structure_module.device)
         atom_coords_noisy = atom_coords + eps
 
         # with torch.no_grad():
@@ -189,7 +238,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         )
 
         for sample_ids_chunk in sample_ids_chunks:
-            atom_coords_denoised_chunk = self.preconditioned_network_forward(
+            atom_coords_denoised_chunk = self.structure_module.preconditioned_network_forward(
                 atom_coords_noisy[sample_ids_chunk],
                 t_hat,
                 network_condition_kwargs=dict(
@@ -199,7 +248,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             )
             atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
 
-        if False and steering_args["fk_steering"] and (
+        if (not self.is_generation) and steering_args["fk_steering"] and (
             (
                 step_idx % steering_args["fk_resampling_interval"] == 0
                 and noise_var > 0
@@ -207,7 +256,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             or step_idx == num_sampling_steps - 1
         ):
             # Compute energy of x_0 prediction
-            energy = torch.zeros(multiplicity, device=self.device)
+            energy = torch.zeros(multiplicity, device=self.structure_module.device)
             for potential in potentials:
                 parameters = potential.compute_parameters(steering_t)
                 if parameters["resampling_weight"] > 0:
@@ -245,7 +294,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             )
 
         # Compute guidance update to x_0 prediction
-        if False and (
+        if (not self.is_generation) and (
             steering_args["physical_guidance_update"]
             or steering_args["contact_guidance_update"]
         ) and step_idx < num_sampling_steps - 1:
@@ -271,12 +320,12 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             scaled_guidance_update = (
                 guidance_update
                 * -1
-                * self.step_scale
+                * self.structure_module.step_scale
                 * (sigma_t - t_hat)
                 / t_hat
             )
 
-        if False and steering_args["fk_steering"] and (
+        if (not self.is_generation) and steering_args["fk_steering"] and (
             (
                 step_idx % steering_args["fk_resampling_interval"] == 0
                 and noise_var > 0
@@ -313,7 +362,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             if token_repr is not None:
                 token_repr = token_repr[resample_indices]
 
-        if self.alignment_reverse_diff:
+        if self.structure_module.alignment_reverse_diff:
             with torch.autocast("cuda", enabled=False):
                 atom_coords_noisy = weighted_rigid_align(
                     atom_coords_noisy.float(),
@@ -330,7 +379,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         )
 
         atom_coords = atom_coords_next
-        return atom_coords, (random_R, random_tr), eps
+        return atom_coords, (random_R, random_tr), eps, (scaled_guidance_update, energy_traj, resample_weights)
 
     def _diffusion_sample(
         self,
@@ -350,6 +399,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             or steering_args["contact_guidance_update"]
         ):
             potentials = get_potentials(steering_args, boltz2=True)
+        else: potentials = None
 
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
@@ -357,16 +407,18 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             resample_weights = torch.ones(multiplicity, device=self.device).reshape(
                 -1, steering_args["num_particles"]
             )
-        # if (
-        #     steering_args["physical_guidance_update"]
-        #     or steering_args["contact_guidance_update"]
-        # ):
-        #     scaled_guidance_update = torch.zeros(
-        #         (multiplicity, *atom_mask.shape[1:], 3),
-        #         dtype=torch.float32,
-        #         device=self.device,
-        #     )
-        # else: scaled_guidance_update = None
+        else:
+            energy_traj, resample_weights = None, None
+        if (not native_self.is_generation) and (
+            steering_args["physical_guidance_update"]
+            or steering_args["contact_guidance_update"]
+        ):
+            scaled_guidance_update = torch.zeros(
+                (multiplicity, *atom_mask.shape[1:], 3),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else: scaled_guidance_update = None
         if max_parallel_samples is None:
             max_parallel_samples = multiplicity
 
@@ -392,7 +444,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
 
         # gradually denoise
         for step_idx, (sigma_tm, sigma_t, gamma) in enumerate(sigmas_and_gammas):
-            atom_coords, random_aug, eps = native_self._diffusion_one_step(
+            atom_coords, random_aug, eps, (scaled_guidance_update, energy_traj, resample_weights) = native_self._diffusion_one_step(
                 step_idx,
                 sigma_tm,
                 sigma_t,
@@ -408,7 +460,10 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                 random_aug=None,
                 eps=None,
                 # local variables
-                scaled_guidance_update=None,
+                scaled_guidance_update=scaled_guidance_update,
+                potentials=potentials,
+                energy_traj=energy_traj,
+                resample_weights=resample_weights,
                 **network_condition_kwargs,
             )
             native_self._traj[-1][-2] = random_aug
@@ -461,7 +516,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                 step_idx = len(sigmas_and_gammas) - reverse_step_idx - 1
                 atom_coords, random_aug, eps = native_self._traj[step_idx]
                 atom_coords = atom_coords.detach().requires_grad_(True)
-                atom_coords_next, _, _ = native_self._diffusion_one_step(
+                atom_coords_next, _, _, _ = native_self._diffusion_one_step(
                     step_idx,
                     sigma_tm,
                     sigma_t,
@@ -665,6 +720,13 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                 )
                 dict_out.update(struct_out)
         
+        if not self.is_generation:
+            with torch.no_grad():
+                dict_out.update(self._confidence(s_inputs, s, z, pdistogram, dict_out['sample_atom_coords'], feats, diffusion_samples, run_confidence_sequentially))
+                loss, loss_details = self.get_loss(dict_out)
+                dict_out['loss_details'] = loss_details
+            return dict_out, {}
+
         atom_coords, s_inputs, s, z, pdistogram, res_type = get_detached_tensors([dict_out['sample_atom_coords'], s_inputs, s, z, pdistogram, res_type])
         feats['res_type'] = res_type
         with torch.set_grad_enabled(True):
@@ -707,6 +769,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         
         # set gradients
         dict_out['gradient'] = dres_type
+        dict_out['loss_details'] = loss_details
         
         return dict_out, loss_details
 
@@ -716,11 +779,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         '''
         try:
             with torch.set_grad_enabled(False):
-                step = 0
-                res_type = batch['res_type'].detach().float().requires_grad_(True)
-                optimizer = torch.optim.AdamW([res_type], lr=1.0)
-                while True:
-                    batch['res_type'] = normalize_prob(res_type.detach())
+                if not self.is_generation:  # only do structure prediction
                     out, loss_details = self(
                         batch,
                         recycling_steps=self.predict_args["recycling_steps"],
@@ -729,14 +788,33 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                         max_parallel_samples=self.predict_args["max_parallel_samples"],
                         run_confidence_sequentially=True,
                     )
-                    with torch.set_grad_enabled(True):  # backward the normalize process
-                        normalized_res_type = normalize_prob(res_type)
-                        res_type.grad = torch.autograd.grad(outputs=[normalized_res_type], inputs=res_type, grad_outputs=[out['gradient']])[0]
-
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    print(f'step {step}, loss {loss_details}, after updates, residues {res_type[0][0]}, normalized {normalized_res_type[0][0]}')
-                    step += 1
+                else:   # do generation
+                    step = 0
+                    res_type = batch['res_type'].detach().float().requires_grad_(True)
+                    with torch.no_grad():
+                        res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
+                    optimizer = torch.optim.AdamW([res_type], lr=1.0)
+                    while step < self.generator_config.max_inner_steps:
+                        batch['res_type'] = normalize_prob(res_type.detach(), self.masks)
+                        start = time.time()
+                        out, loss_details = self(
+                            batch,
+                            recycling_steps=self.predict_args["recycling_steps"],
+                            num_sampling_steps=default(self.generator_config.inner_diffusion_steps, self.predict_args["sampling_steps"]),
+                            diffusion_samples=self.predict_args["diffusion_samples"],
+                            max_parallel_samples=self.predict_args["max_parallel_samples"],
+                            run_confidence_sequentially=True,
+                        )
+                        with torch.set_grad_enabled(True):  # backward the normalize process
+                            normalized_res_type = normalize_prob(res_type, self.masks)
+                            res_type.grad = torch.autograd.grad(outputs=[normalized_res_type], inputs=res_type, grad_outputs=[out['gradient']])[0]
+                        original_res_type = res_type.clone()
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        res_type[~self.masks] = original_res_type[~self.masks]
+                        print(f'inner step {step}, lossw {loss_details}, elapsed {time.time() - start}s, after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
+                        # print(f'inner step {step}, loss {loss_details}, elapsed {time.time() - start}s')
+                        step += 1
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
                 for key in self.predict_args["keys_dict_batch"]:
@@ -791,9 +869,11 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                     pred_dict["affinity_probability_binary2"] = out[
                         "affinity_probability_binary2"
                     ]
-
-            # TODO: we can add our things here
-            pred_dict['gradient'] = out['gradient']
+            
+            pred_dict['loss_details'] = out['loss_details']
+            if self.is_generation:
+                pred_dict['optimized_res_logits'] = res_type
+                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks)
             return pred_dict
 
         except RuntimeError as e:  # catch out of memory exceptions

@@ -2,7 +2,7 @@
 demo to run structure prediction:
 
 ```bash
-python -m design.main --config ../tmp/input.yaml --out_dir ../tmp/out_design --ckpt_dir ../.boltz/
+python -m design.main --config ../demo/HA.yaml --out_dir ../tmp/out_demo/ --ckpt_dir ../.boltz/
 ```
 
 kernel codes changed:
