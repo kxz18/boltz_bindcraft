@@ -16,6 +16,7 @@ from boltz.model.modules.diffusionv2 import *
 
 from design.utils.logger import print_log, cuda_memory_summary
 from .loss import parse_losses
+from .info import ComplexInfo
 
 
 def get_detached_tensors(tensors):
@@ -114,12 +115,16 @@ class InputEmbedderWrapper(nn.Module):
 
 @dataclass
 class BoltzGOConfig:
+    lr: float = 1.0
     max_inner_steps: int = 10
     max_outer_steps: int = 100
+    inner_enc_recycling_steps: Optional[int] = None # if none use the default in Boltz2
     inner_diffusion_steps: Optional[int] = None # if none, use the default in Boltz2
 
     init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0    # offset for the initial logits
+
+    verbose: bool = False
 
 
 class BoltzGO(Boltz2):  # boltz with gradient optimization
@@ -140,18 +145,28 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         with open(yaml_path, 'r') as fin: config = yaml.safe_load(fin)
         self.generator_config = BoltzGOConfig(**config['generator']['config'])
         self.losses = parse_losses(config['generator']['loss']) 
+        self.outer_loop_count = 0
 
+        # complex information
+        # chain ids
+        chain_ids = []
+        chain_orders = {}
         # generate mask
         self.masks = []
         masks = config['generator']['masks']
-        for seq in config['sequences']:
+        for i, seq in enumerate(config['sequences']):
             chain_id = seq['protein']['id']
+            chain_ids.extend([chain_id for _ in seq['protein']['sequence']])
+            chain_orders[chain_id] = i
             if chain_id not in masks: self.masks.extend([False for _ in seq['protein']['sequence']])
             else: self.masks.extend([(False if c == '0' else True) for c in masks[chain_id]])
         self.masks = torch.tensor(self.masks, dtype=bool, device=self.structure_module.device)[None, :] # batch size = 1
-
+        self.cplx_info = ComplexInfo(chain_ids, chain_orders, self.masks)
         # dynamic recording variables
         self._traj = []
+
+    def increase_outer_loop(self):
+        self.outer_loop_count += 1
 
     def set_mode_generation(self, is_generation: bool=True):
         self.is_generation = is_generation
@@ -160,14 +175,14 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         for name, p in self.named_parameters():
             p.requires_grad_(mode)
 
-    def get_loss(self, dict_out: str):
+    def get_loss(self, dict_out: dict, feats: dict):
         loss, loss_details = 0, {}
         for name in self.losses:
             w, loss_cls = self.losses[name]
-            l, v = loss_cls(dict_out, self.masks)
+            l, v = loss_cls(dict_out, feats, self.cplx_info)
             loss += w * l
             loss_details[name] = v
-        loss_details['total'] = loss.item()
+        loss_details['total'] = round(loss.item(), 2)
         return loss, loss_details
 
     def _diffusion_one_step(
@@ -723,7 +738,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         if not self.is_generation:
             with torch.no_grad():
                 dict_out.update(self._confidence(s_inputs, s, z, pdistogram, dict_out['sample_atom_coords'], feats, diffusion_samples, run_confidence_sequentially))
-                loss, loss_details = self.get_loss(dict_out)
+                loss, loss_details = self.get_loss(dict_out, feats)
                 dict_out['loss_details'] = loss_details
             return dict_out, {}
 
@@ -731,12 +746,14 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         feats['res_type'] = res_type
         with torch.set_grad_enabled(True):
             dict_out.update(self._confidence(s_inputs, s, z, pdistogram, atom_coords, feats, diffusion_samples, run_confidence_sequentially))
-            loss, loss_details = self.get_loss(dict_out)
+            loss, loss_details = self.get_loss(dict_out, feats)
             dx, ds_inputs, ds, dz, dd, dres_type = torch.autograd.grad(loss, [atom_coords, s_inputs, s, z, pdistogram, res_type], retain_graph=False, allow_unused=True)
             # TODO: problem: why no grad to dx? x is discretized into pdistograms which are later added to z
         
         # backward for diffusion
         if dx is None: dx = torch.zeros_like(atom_coords)   # no coordinate related part in the loss
+        if ds is None: ds = torch.zeros_like(s)
+        if ds_inputs is None: ds_inputs = torch.zeros_like(s_inputs)
         vs, vs_inputs, dq, dc, datom_enc_bias, datom_dec_bias, dtoken_trans_bias = self._diffusion_sample_backward(
             dx=dx,
             s_trunk=s.float(),
@@ -792,19 +809,24 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                     step = 0
                     res_type = batch['res_type'].detach().float().requires_grad_(True)
                     with torch.no_grad():
-                        res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
-                    optimizer = torch.optim.AdamW([res_type], lr=1.0)
+                        if self.outer_loop_count == 0:  # the initial round
+                            res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
+                        else:
+                            res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
+                    optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
+                    loss_traj = []
                     while step < self.generator_config.max_inner_steps:
                         batch['res_type'] = normalize_prob(res_type.detach(), self.masks)
                         start = time.time()
                         out, loss_details = self(
                             batch,
-                            recycling_steps=self.predict_args["recycling_steps"],
+                            recycling_steps=default(self.generator_config.inner_enc_recycling_steps, self.predict_args["recycling_steps"]),
                             num_sampling_steps=default(self.generator_config.inner_diffusion_steps, self.predict_args["sampling_steps"]),
                             diffusion_samples=self.predict_args["diffusion_samples"],
                             max_parallel_samples=self.predict_args["max_parallel_samples"],
                             run_confidence_sequentially=True,
                         )
+                        loss_traj.append(loss_details)
                         with torch.set_grad_enabled(True):  # backward the normalize process
                             normalized_res_type = normalize_prob(res_type, self.masks)
                             res_type.grad = torch.autograd.grad(outputs=[normalized_res_type], inputs=res_type, grad_outputs=[out['gradient']])[0]
@@ -812,8 +834,9 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                         optimizer.step()
                         optimizer.zero_grad()
                         res_type[~self.masks] = original_res_type[~self.masks]
-                        print(f'inner step {step}, lossw {loss_details}, elapsed {time.time() - start}s, after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
-                        # print(f'inner step {step}, loss {loss_details}, elapsed {time.time() - start}s')
+                        print_log(f'inner step {step}, total loss {loss_details["total"]}, details {loss_details}, elapsed {round(time.time() - start, 2)}s')
+                        if self.generator_config.verbose:
+                            print_log(f'after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
                         step += 1
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
@@ -874,6 +897,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             if self.is_generation:
                 pred_dict['optimized_res_logits'] = res_type
                 pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks)
+                pred_dict['loss_traj'] = loss_traj
             return pred_dict
 
         except RuntimeError as e:  # catch out of memory exceptions

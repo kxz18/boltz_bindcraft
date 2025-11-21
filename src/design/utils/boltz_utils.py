@@ -106,6 +106,8 @@ def prepare_boltz2(
         num_subsampled_msa: int = 1024,
         no_kernels: bool = False,
         write_embeddings: bool = False,
+
+        silent: bool = False
     ):
     # Set no grad
     torch.set_grad_enabled(False)
@@ -271,7 +273,8 @@ def prepare_boltz2(
         accelerator=accelerator,
         devices=devices,
         precision="bf16-mixed",
-        inference_mode=False    # this is for gradient calculation
+        inference_mode=False,    # this is for gradient calculation
+        enable_progress_bar=(not silent)
     )
 
     if filtered_manifest.records:

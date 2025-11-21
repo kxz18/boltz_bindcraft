@@ -3,6 +3,7 @@
 import os
 import yaml
 import time
+import json
 import shutil
 import tempfile
 import argparse
@@ -48,6 +49,7 @@ def main(args):
         data = args.config,
         out_dir = args.out_dir,
         cache = args.ckpt_dir,
+        silent = True
     )
     print_log(f'Setting up additional configurations')
     model_module.eval()
@@ -72,6 +74,7 @@ def main(args):
     result_dir = os.path.join(args.out_dir, 'results')
     os.makedirs(result_dir)
 
+    loss_traj = None
     # Compute structure predictions
     while rnd < model_module.generator_config.max_outer_steps:
         # do structure prediction
@@ -86,6 +89,9 @@ def main(args):
         print_log(f'loss: {res["loss_details"]}')
         # save the predictions to another place
         os.system(f'mv {os.path.join(args.out_dir, f"boltz_results_{name}", "predictions", f"round{rnd}")} {result_dir}')
+        # save the loss trajectory
+        if loss_traj is not None:
+            with open(os.path.join(result_dir, f'round{rnd}', 'loss_traj.json'), 'w') as fout: json.dump(loss_traj, fout, indent=2)
 
         # do generation
         model_module.set_mode_generation(True)
@@ -95,11 +101,13 @@ def main(args):
             return_predictions=True,
         )[0]
 
+        loss_traj = res['loss_traj']    # update trajectory
         print_log(f'after optimization: {res["loss_details"]}')
         print_log(f'outer loop elapsed {round(time.time() - start, 2)}s')
         print()
 
         rnd += 1
+        model_module.increase_outer_loop()
         # update sequence for the next round
         next_config_path = os.path.join(config_dir, f'round{rnd}.yaml')
         new_seqs = update_sequence_to_config(config_path, next_config_path, res['optimized_res_type'])
