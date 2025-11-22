@@ -36,12 +36,19 @@ def normalize_prob(p, m):
     return p
 
 
-def logits_to_types(logits, generate_mask):
+def logits_to_types(logits, generate_mask, k=1):
     mask = [(0 if ((name not in prot_token_to_letter) or (name == 'UNK') or (name == '-')) else 1) for name in tokens]
     mask = torch.tensor(mask, dtype=bool, device=logits.device)
-    logits = logits.masked_fill(~mask[None, None, :], float('-inf'))
-    index = torch.argmax(logits, dim=-1)    # you can adjust strategies here
-    return [prot_token_to_letter[tokens[i]] for i in index[0]]
+    generate_mask = generate_mask.to(logits.device)
+    logits = logits.masked_fill((~mask[None, None, :]) & generate_mask.unsqueeze(-1), float('-inf'))
+    logits[generate_mask] = torch.softmax(logits[generate_mask], dim=-1)
+    index = torch.multinomial(logits[0], num_samples=k, replacement=True)    # [N, k], assume batch size = 1
+    all_seqs = []
+    for j in range(k):
+        all_seqs.append([prot_token_to_letter[tokens[i]] for i in index[:, j]])
+        # index = torch.argmax(logits, dim=-1)    # you can adjust strategies here
+    return all_seqs
+    # return [prot_token_to_letter[tokens[i]] for i in index[0]]
 
 
 class InputEmbedderWrapper(nn.Module):
@@ -123,6 +130,8 @@ class BoltzGOConfig:
 
     init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0    # offset for the initial logits
+
+    sample_k: int = 5           # number of samples for discretization
 
     verbose: bool = False
 
@@ -896,7 +905,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             pred_dict['loss_details'] = out['loss_details']
             if self.is_generation:
                 pred_dict['optimized_res_logits'] = res_type
-                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks)
+                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks, self.generator_config.sample_k)
                 pred_dict['loss_traj'] = loss_traj
             return pred_dict
 

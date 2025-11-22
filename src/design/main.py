@@ -64,7 +64,7 @@ def main(args):
     rnd = 0
     config_dir = os.path.join(args.out_dir, 'configs')
     os.makedirs(config_dir, exist_ok=True)
-    config_path = os.path.join(config_dir, f'round{rnd}.yaml')
+    config_path = os.path.join(config_dir, f'round{rnd}_0.yaml')
     os.system(f'cp {args.config} {config_path}')
     # update config path
     manifest = data_updater([Path(config_path).expanduser()])
@@ -74,24 +74,61 @@ def main(args):
     result_dir = os.path.join(args.out_dir, 'results')
     os.makedirs(result_dir)
 
-    loss_traj = None
+    loss_traj, new_res_types, history = None, [None], {}
     # Compute structure predictions
     while rnd < model_module.generator_config.max_outer_steps:
         # do structure prediction
-        model_module.set_mode_generation(False)
-        start = time.time()
-        res = trainer.predict(
-            model_module,
-            datamodule=data_module,
-            return_predictions=True,
-        )[0]
-        print_log(f'structure prediction elapsed {round(time.time() - start, 2)}s')
-        print_log(f'loss: {res["loss_details"]}')
-        # save the predictions to another place
-        os.system(f'mv {os.path.join(args.out_dir, f"boltz_results_{name}", "predictions", f"round{rnd}")} {result_dir}')
+        rnd_res_dir = os.path.join(result_dir, f'round{rnd}')
+        os.makedirs(rnd_res_dir, exist_ok=True)
+        i2config, i2loss = {}, {}
+        for i, res_type in enumerate(new_res_types):
+            if res_type is not None:    # update sequence in the configuration
+                next_config_path = os.path.join(config_dir, f'round{rnd}_{i}.yaml')
+                new_seqs = update_sequence_to_config(config_path, next_config_path, res_type)
+                # config_path = next_config_path
+                # update config path
+                manifest = data_updater([Path(next_config_path).expanduser()])
+                data_module.manifest = manifest
+                model_module.setup_config(next_config_path)
+                print_log(f'evaluating {i}-th seqs: {new_seqs}')
+            else: next_config_path, new_seqs = config_path, 'init'
+            i2config[i] = next_config_path
+            # structure prediction
+            model_module.set_mode_generation(False)
+            start = time.time()
+            res = trainer.predict(
+                model_module,
+                datamodule=data_module,
+                return_predictions=True,
+            )[0]
+            print_log(f'structure prediction elapsed {round(time.time() - start, 2)}s')
+            print_log(f'loss: {res["loss_details"]}')
+            i2loss[i] = res['loss_details']
+            history[f'round{rnd}_{i}'] = (new_seqs, res['loss_details'])
+            # save the predictions to another place
+            os.system(f'mv {os.path.join(args.out_dir, f"boltz_results_{name}", "predictions", f"round{rnd}_{i}")} {os.path.join(rnd_res_dir, str(i))}')
         # save the loss trajectory
         if loss_traj is not None:
-            with open(os.path.join(result_dir, f'round{rnd}', 'loss_traj.json'), 'w') as fout: json.dump(loss_traj, fout, indent=2)
+            with open(os.path.join(rnd_res_dir, 'loss_traj.json'), 'w') as fout: json.dump(loss_traj, fout, indent=2)
+        # save history records
+        history = dict(sorted(history.items(), key=lambda x: x[1][1]['total'])) # sort by loss
+        with open(os.path.join(result_dir, 'history.json'), 'w') as fout: json.dump(history, fout)
+
+        # use the best one for next round
+        best_i = min(i2loss, key=lambda i: i2loss[i]['total'])
+        config_path = i2config[best_i]
+        print_log(f'Best one with loss: {i2loss[i]}')
+        # get topk in the history
+        topk = 5
+        print_log(f'History top 10')
+        for i, cid in enumerate(history):
+            if i == topk: break
+            print_log(f'\t{i}. {cid} {history[cid]}')
+        # update config path
+        manifest = data_updater([Path(config_path).expanduser()])
+        data_module.manifest = manifest
+        model_module.setup_config(config_path)
+        print_log(f'Using configuration from {config_path} for optimization')
 
         # do generation
         model_module.set_mode_generation(True)
@@ -102,24 +139,25 @@ def main(args):
         )[0]
 
         loss_traj = res['loss_traj']    # update trajectory
-        print_log(f'after optimization: {res["loss_details"]}')
+        # print_log(f'after optimization: {res["loss_details"]}')
         print_log(f'outer loop elapsed {round(time.time() - start, 2)}s')
         print()
 
         rnd += 1
         model_module.increase_outer_loop()
         # update sequence for the next round
-        next_config_path = os.path.join(config_dir, f'round{rnd}.yaml')
-        new_seqs = update_sequence_to_config(config_path, next_config_path, res['optimized_res_type'])
-        config_path = next_config_path
-        # update config path
-        manifest = data_updater([Path(config_path).expanduser()])
-        data_module.manifest = manifest
-        model_module.setup_config(config_path)
+        new_res_types = res['optimized_res_type']
+        # next_config_path = os.path.join(config_dir, f'round{rnd}.yaml')
+        # new_seqs = update_sequence_to_config(config_path, next_config_path, res['optimized_res_type'])
+        # config_path = next_config_path
+        # # update config path
+        # manifest = data_updater([Path(config_path).expanduser()])
+        # data_module.manifest = manifest
+        # model_module.setup_config(config_path)
 
         # start logging for next round
         print_log('=' * 20 + f'Round {rnd}' + '=' * 20)
-        print_log(f'updated sequence: {new_seqs}')
+        # print_log(f'updated sequence: {new_seqs}')
 
 
 if __name__ == '__main__':

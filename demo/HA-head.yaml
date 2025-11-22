@@ -23,12 +23,13 @@ generator:
     max_inner_steps: 10
     max_outer_steps: 100
     # inner_diffusion_steps: 20
+    sample_k: 5
   loss:
     - class: pLDDT
       weight: 0.5
     - class: CPipTM
       chain_pairs: [[A, H], [B, H]]
-      weight: 0.1
+      weight: 0.0
     - class: FWAway
       binder_chains: [H]
       contact_th: 10.0

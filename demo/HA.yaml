@@ -22,8 +22,9 @@ generator:
     lr: 1.0
     max_inner_steps: 10
     max_outer_steps: 100
-    # inner_recycling_steps: 0
+    # inner_enc_recycling_steps: 0
     # inner_diffusion_steps: 20
+    sample_k: 5
   loss:
     - class: pLDDT
       weight: 0.5
