@@ -112,7 +112,7 @@ def main(args):
             with open(os.path.join(rnd_res_dir, 'loss_traj.json'), 'w') as fout: json.dump(loss_traj, fout, indent=2)
         # save history records
         history = dict(sorted(history.items(), key=lambda x: x[1][1]['total'])) # sort by loss
-        with open(os.path.join(result_dir, 'history.json'), 'w') as fout: json.dump(history, fout)
+        with open(os.path.join(result_dir, 'history.json'), 'w') as fout: json.dump(history, fout, indent=2)
 
         # use the best one for next round
         best_i = min(i2loss, key=lambda i: i2loss[i]['total'])
