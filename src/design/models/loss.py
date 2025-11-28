@@ -108,9 +108,12 @@ class FWAway(Objective):
         cnt = contact.sum(-1).bool().sum().item()
         if cnt == 0:
             return 0, (self.contact_th, cnt)
-        avg_contact_dist = mink_dist[contact].mean()
-        loss = self.contact_th - avg_contact_dist
-        return loss, (round(avg_contact_dist.item(), 2), cnt)
+        # avg_contact_dist = mink_dist[contact].mean()
+        # loss = self.contact_th - avg_contact_dist
+        # return loss, (round(avg_contact_dist.item(), 2), cnt)
+        contact_dist = mink_dist[contact].sum()
+        loss = self.contact_th * contact.sum() - contact_dist
+        return loss, (round(contact_dist.item(), 2), cnt)
     
 
 @R.register('Epitope')
