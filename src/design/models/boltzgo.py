@@ -887,9 +887,11 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                             self._res_type.grad = res_type.grad
                             res_type = self._res_type
                         optimizer.step()
+                        grad_norm = torch.linalg.norm(res_type.grad[self.masks], dim=-1).mean().item()
+                        grad_norm_str = '{:.2e}'.format(grad_norm)
                         optimizer.zero_grad()
                         res_type[~self.masks] = original_res_type[~self.masks]
-                        print_log(f'inner step {step}, total loss {loss_details["total"]}, details {loss_details}, elapsed {round(time.time() - start, 2)}s')
+                        print_log(f'inner step {step}, total loss {loss_details["total"]}, grad norm {grad_norm_str}, details {loss_details}, elapsed {round(time.time() - start, 2)}s')
                         if self.generator_config.verbose:
                             print_log(f'after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
                             print_log(f'after updates, self._res_tyoe {self._res_type[self.masks][0]}')
