@@ -36,17 +36,20 @@ def normalize_prob(p, m):
     return p
 
 
-def logits_to_types(logits, generate_mask, k=1):
+def logits_to_types(logits, generate_mask, k=1, sample_method='multinomial'):
     mask = [(0 if ((name not in prot_token_to_letter) or (name == 'UNK') or (name == '-')) else 1) for name in tokens]
     mask = torch.tensor(mask, dtype=bool, device=logits.device)
     generate_mask = generate_mask.to(logits.device)
     logits = logits.masked_fill((~mask[None, None, :]) & generate_mask.unsqueeze(-1), float('-inf'))
-    logits[generate_mask] = torch.softmax(logits[generate_mask], dim=-1)
-    index = torch.multinomial(logits[0], num_samples=k, replacement=True)    # [N, k], assume batch size = 1
-    all_seqs = []
-    for j in range(k):
-        all_seqs.append([prot_token_to_letter[tokens[i]] for i in index[:, j]])
-        # index = torch.argmax(logits, dim=-1)    # you can adjust strategies here
+    if sample_method == 'multinomial':
+        logits[generate_mask] = torch.softmax(logits[generate_mask], dim=-1)
+        index = torch.multinomial(logits[0], num_samples=k, replacement=True)    # [N, k], assume batch size = 1
+        all_seqs = []
+        for j in range(k):
+            all_seqs.append([prot_token_to_letter[tokens[i]] for i in index[:, j]])
+    else:
+        index = torch.argmax(logits[0], dim=-1)
+        all_seqs = [[prot_token_to_letter[tokens[i]] for i in index]]
     return all_seqs
     # return [prot_token_to_letter[tokens[i]] for i in index[0]]
 
@@ -127,19 +130,23 @@ class BoltzGOConfig:
     max_outer_steps: int = 100
     inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2
     inner_diffusion_steps: Optional[int] = None         # if none, use the default in Boltz2
-    maintain_logits: bool = False                       # whether to keep the logits between outer loops
+    maintain_logits: bool = False                       # whether to keep the logits between outer loops. if true, the optimizer and the logits will be maintained
     use_history_best: bool = False                      # whether to use history best as starters for each outer loops
 
     init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0    # offset for the initial logits
 
     sample_k: int = 5           # number of samples for discretization
+    sample_method: str = 'multinomial'
 
     verbose: bool = False
 
 
     def check_validity(self):
         if self.use_history_best: assert not self.maintain_logits, f'use_history_best={self.use_history_best} is not compatible with maintain_logits={self.maintain_logits}'
+        assert self.sample_method in ['multinomial', 'argmax'], f'sample_method {self.sample_method} not recognized.'
+        if self.sample_method == 'argmax': assert self.sample_k == 1, f'sample_k should be 1 with sample_method={self.sample_method}'
+
 
 class BoltzGO(Boltz2):  # boltz with gradient optimization
 
@@ -158,6 +165,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         # generation-related
         with open(yaml_path, 'r') as fin: config = yaml.safe_load(fin)
         self.generator_config = BoltzGOConfig(**config['generator']['config'])
+        self.generator_config.check_validity()
         self.losses = parse_losses(config['generator']['loss']) 
         self.outer_loop_count = 0
 
@@ -198,6 +206,24 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             loss_details[name] = v
         loss_details['total'] = round(loss.item(), 2)
         return loss, loss_details
+
+    def _initialize(self, batch):
+        if self.generator_config.maintain_logits:
+            if self.outer_loop_count == 0: # the initial round
+                res_type = batch['res_type'].detach().float().requires_grad_(True)
+                res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
+                optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
+                self._res_type, self._optimizer = res_type, optimizer
+            else: res_type, optimizer = self._res_type, self._optimizer
+        else:   # start from the discretized state
+            res_type = batch['res_type'].detach().float().requires_grad_(True)
+            with torch.no_grad():
+                if self.outer_loop_count == 0:  # the initial round
+                    res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
+                else:
+                    res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
+            optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
+        return res_type, optimizer  # logits and optimizer
 
     def _diffusion_one_step(
         self,
@@ -821,13 +847,16 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                     )
                 else:   # do generation
                     step = 0
-                    res_type = batch['res_type'].detach().float().requires_grad_(True)
-                    with torch.no_grad():
-                        if self.outer_loop_count == 0:  # the initial round
-                            res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
-                        else:
-                            res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
-                    optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
+                    res_type, optimizer = self._initialize(batch)
+                    # res_type = batch['res_type'].detach().float().requires_grad_(True)
+                    # with torch.no_grad():
+                    #     if self.outer_loop_count == 0:  # the initial round
+                    #         res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
+                    #     else:
+                    #         res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
+                    # optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
+                    if self.generator_config.verbose:
+                        print_log(f'initialize, residues {res_type[self.masks][0]}')
                     loss_traj = []
                     while step < self.generator_config.max_inner_steps:
                         batch['res_type'] = normalize_prob(res_type.detach(), self.masks)
