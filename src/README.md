@@ -9,3 +9,8 @@ kernel codes changed:
 
 1. `boltz/model/layers/pairformer.py` for checkpointing
 2. `boltz/model/modules/trunkv2.py` MSA module for checkpointing
+
+
+additional dependencies:
+
+matplotlib, seaborn
