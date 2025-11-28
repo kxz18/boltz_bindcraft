@@ -52,6 +52,7 @@ def main(args):
         silent = True
     )
     print_log(f'Setting up additional configurations')
+    model_module.init()
     model_module.eval()
     model_module.setup_config(args.config)
     model_module.enable_param_gradients()

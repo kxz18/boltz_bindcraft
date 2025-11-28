@@ -152,24 +152,31 @@ class BoltzGOConfig:
 
 class BoltzGO(Boltz2):  # boltz with gradient optimization
 
-    def setup_config(
+    def init(
         self,
-        yaml_path: str,
         atom_embedding_mode: Literal['common', 'none', 'unk'] = 'common',
-    ):# otherwise backward through pairformer will throw errors
+    ):
         # basics
         self.is_generation = True  # do structure prediction or generation
         self.input_embedder_wrapper = InputEmbedderWrapper(self.input_embedder, atom_embedding_mode)
         self.confidence_module.pairformer_stack.set_force_checkpointing()
         self.pairformer_module.set_force_checkpointing()
         self.use_kernels = False    # otherwise backward through pairformer will throw errors
+        self.outer_loop_count = 0
+        # dynamic recording variables
+        self._traj = []
+        
+
+    def setup_config(
+        self,
+        yaml_path: str,
+    ):# otherwise backward through pairformer will throw errors
 
         # generation-related
         with open(yaml_path, 'r') as fin: config = yaml.safe_load(fin)
         self.generator_config = BoltzGOConfig(**config['generator']['config'])
         self.generator_config.check_validity()
         self.losses = parse_losses(config['generator']['loss']) 
-        self.outer_loop_count = 0
 
         # complex information
         # chain ids
@@ -186,8 +193,6 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             else: self.masks.extend([(False if c == '0' else True) for c in masks[chain_id]])
         self.masks = torch.tensor(self.masks, dtype=bool, device=self.structure_module.device)[None, :] # batch size = 1
         self.cplx_info = ComplexInfo(chain_ids, chain_orders, self.masks)
-        # dynamic recording variables
-        self._traj = []
 
     def increase_outer_loop(self):
         self.outer_loop_count += 1
@@ -212,6 +217,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
     def _initialize(self, batch):
         if self.generator_config.maintain_logits:
             if self.outer_loop_count == 0: # the initial round
+                print_log(f'Initialize maintained logits from Gaussian')
                 res_type = batch['res_type'].detach().float().requires_grad_(True)
                 res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
                 optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
@@ -221,6 +227,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             res_type = batch['res_type'].detach().float().requires_grad_(True)
             with torch.no_grad():
                 if self.outer_loop_count == 0:  # the initial round
+                    print_log(f'Initialize residue logits from Gaussian')
                     res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
                 else:
                     res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
@@ -876,12 +883,16 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                             normalized_res_type = normalize_prob(res_type, self.masks)
                             res_type.grad = torch.autograd.grad(outputs=[normalized_res_type], inputs=res_type, grad_outputs=[out['gradient']])[0]
                         original_res_type = res_type.clone()
+                        if self.generator_config.maintain_logits:
+                            self._res_type.grad = res_type.grad
+                            res_type = self._res_type
                         optimizer.step()
                         optimizer.zero_grad()
                         res_type[~self.masks] = original_res_type[~self.masks]
                         print_log(f'inner step {step}, total loss {loss_details["total"]}, details {loss_details}, elapsed {round(time.time() - start, 2)}s')
                         if self.generator_config.verbose:
                             print_log(f'after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
+                            print_log(f'after updates, self._res_tyoe {self._res_type[self.masks][0]}')
                         step += 1
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
