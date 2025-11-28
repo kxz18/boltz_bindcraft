@@ -74,7 +74,7 @@ def main(args):
     result_dir = os.path.join(args.out_dir, 'results')
     os.makedirs(result_dir)
 
-    loss_traj, new_res_types, history = None, [None], {}
+    loss_traj, new_res_types, history, history_configs = None, [None], {}, {}
     # Compute structure predictions
     while rnd < model_module.generator_config.max_outer_steps:
         # do structure prediction
@@ -105,6 +105,7 @@ def main(args):
             print_log(f'loss: {res["loss_details"]}')
             i2loss[i] = res['loss_details']
             history[f'round{rnd}_{i}'] = (new_seqs, res['loss_details'])
+            history_configs[f'round{rnd}_{i}'] = next_config_path
             # save the predictions to another place
             os.system(f'mv {os.path.join(args.out_dir, f"boltz_results_{name}", "predictions", f"round{rnd}_{i}")} {os.path.join(rnd_res_dir, str(i))}')
         # save the loss trajectory
@@ -115,12 +116,19 @@ def main(args):
         with open(os.path.join(result_dir, 'history.json'), 'w') as fout: json.dump(history, fout, indent=2)
 
         # use the best one for next round
-        best_i = min(i2loss, key=lambda i: i2loss[i]['total'])
-        config_path = i2config[best_i]
-        print_log(f'Best one with loss: {i2loss[i]}')
+        config_path = os.path.join(config_dir, f'round{rnd}.yaml')
+        if model_module.generator_config.use_history_best:
+            # use history best for next round
+            best_i = min(history, key=lambda i: history[i][1]['total'])
+            os.system(f'cp {history_configs[best_i]} {config_path}')
+            print_log(f'Best one in history ({best_i}) with loss: {history[best_i][1]}')
+        else:
+            best_i = min(i2loss, key=lambda i: i2loss[i]['total'])
+            os.system(f'cp {i2config[best_i]} {config_path}')
+            print_log(f'Best one in this loop ({best_i}) with loss: {i2loss[i]}')
         # get topk in the history
         topk = 5
-        print_log(f'History top 10')
+        print_log(f'History top {topk}')
         for i, cid in enumerate(history):
             if i == topk: break
             print_log(f'\t{i}. {cid} {history[cid]}')

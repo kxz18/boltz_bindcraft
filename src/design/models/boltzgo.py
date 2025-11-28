@@ -125,8 +125,10 @@ class BoltzGOConfig:
     lr: float = 1.0
     max_inner_steps: int = 10
     max_outer_steps: int = 100
-    inner_enc_recycling_steps: Optional[int] = None # if none use the default in Boltz2
-    inner_diffusion_steps: Optional[int] = None # if none, use the default in Boltz2
+    inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2
+    inner_diffusion_steps: Optional[int] = None         # if none, use the default in Boltz2
+    maintain_logits: bool = False                       # whether to keep the logits between outer loops
+    use_history_best: bool = False                      # whether to use history best as starters for each outer loops
 
     init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0    # offset for the initial logits
@@ -135,6 +137,9 @@ class BoltzGOConfig:
 
     verbose: bool = False
 
+
+    def check_validity(self):
+        if self.use_history_best: assert not self.maintain_logits, f'use_history_best={self.use_history_best} is not compatible with maintain_logits={self.maintain_logits}'
 
 class BoltzGO(Boltz2):  # boltz with gradient optimization
 
