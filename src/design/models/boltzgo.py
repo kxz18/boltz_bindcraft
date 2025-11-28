@@ -47,9 +47,11 @@ def logits_to_types(logits, generate_mask, k=1, sample_method='multinomial'):
         all_seqs = []
         for j in range(k):
             all_seqs.append([prot_token_to_letter[tokens[i]] for i in index[:, j]])
-    else:
+    elif sample_method == 'argmax':
         index = torch.argmax(logits[0], dim=-1)
         all_seqs = [[prot_token_to_letter[tokens[i]] for i in index]]
+    else:
+        raise NotImplementedError(f'sample method {sample_method} not implemented')
     return all_seqs
     # return [prot_token_to_letter[tokens[i]] for i in index[0]]
 
@@ -939,7 +941,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             pred_dict['loss_details'] = out['loss_details']
             if self.is_generation:
                 pred_dict['optimized_res_logits'] = res_type
-                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks, self.generator_config.sample_k)
+                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks, self.generator_config.sample_k, self.generator_config.sample_method)
                 pred_dict['loss_traj'] = loss_traj
             return pred_dict
 
