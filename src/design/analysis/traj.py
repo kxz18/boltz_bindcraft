@@ -28,6 +28,7 @@ def get_best(name, vals, largest=None):
         }[name]
     if isinstance(largest, tuple):
         return [get_best(name, [t[i] for t in vals], largest=largest[i]) for i in range(len(largest))]
+    else:
         return max(vals) if largest else min(vals)
     
 
@@ -111,19 +112,23 @@ def main(args):
     for metric_type in metrics:
         for metric_name in metrics[metric_type]:
             x_name = 'round'
+            hue_name = 'type'
             data = {
                 metric_name: [],
-                x_name: []
+                x_name: [],
+                hue_name: []
             }
             for r in history_metrics:
                 if r not in traj: continue
-                # data[x_name].append(r)
-                # data[metric_name].append(get_metric_val(history_metrics[r]['best'], metric_name))
+                data[x_name].append(float(r))
+                data[metric_name].append(get_metric_val(history_metrics[r]['best'], metric_name))
+                data[hue_name].append('discretized')
                 for i, val in enumerate(traj[r]):
-                    data[x_name].append(r - 1 + i / len(traj[r]))
+                    data[x_name].append(r - 1 + i * 1.0 / len(traj[r]))
                     data[metric_name].append(get_metric_val(val, metric_name))
+                    data[hue_name].append('logits')
             # draw picture
-            lineplot(data, x_name, metric_name, save_path=os.path.join(args.out_dir, metric_name + '.png'))
+            lineplot(data, x_name, metric_name, hue_name, save_path=os.path.join(args.out_dir, metric_name + '.png'))
             print_log(f'Finished curves for {metric_name}')
 
 if __name__ == '__main__':
