@@ -14,3 +14,7 @@ kernel codes changed:
 additional dependencies:
 
 matplotlib, seaborn
+
+```bash
+python -m design.analysis.traj --res_dir ../tmp/HA-stem
+```
