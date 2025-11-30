@@ -130,7 +130,7 @@ class BoltzGOConfig:
     lr: float = 1.0
     max_inner_steps: int = 10
     max_outer_steps: int = 100
-    inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2
+    inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2 (default is 3)
     inner_diffusion_steps: Optional[int] = None         # if none, use the default in Boltz2
     maintain_logits: bool = False                       # whether to keep the logits between outer loops. if true, the optimizer and the logits will be maintained
     use_history_best: bool = False                      # whether to use history best as starters for each outer loops
