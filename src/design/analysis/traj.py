@@ -24,7 +24,9 @@ def get_best(name, vals, largest=None):
             'CPipTM': True,
             'FWAway': (True, False),
             'Epitope': False,
-            'total': False
+            'total': False,
+            'ChainpLDDT': True,
+            'GenPartpLDDT': True
         }[name]
     if isinstance(largest, tuple):
         return [get_best(name, [t[i] for t in vals], largest=largest[i]) for i in range(len(largest))]
