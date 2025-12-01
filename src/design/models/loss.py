@@ -36,7 +36,38 @@ class pLDDT(Objective):
     def __call__(self, dict_out, feats, cplx_info: ComplexInfo):
         plddt = dict_out['plddt'].mean()
         return 1.0 - plddt, round(plddt.item(), 3)
+
+
+@R.register('ChainpLDDT')
+class ChainpLDDT(Objective):
+    '''
+        pLDDT of selected chains
+    '''
+    def __init__(self, selected_chains):
+        super().__init__()
+        self.selected_chains = selected_chains
     
+    def __call__(self, dict_out, feats, cplx_info: ComplexInfo):
+        mask = []
+        for c in cplx_info.chain_ids:
+            if c in self.selected_chains: mask.append(True)
+            else: mask.append(False)
+        plddt = dict_out['plddt'][0]    # assume batch size == 1
+        mask = torch.tensor(mask, dtype=bool, device=plddt.device)
+        plddt = plddt[mask].mean()
+        return 1.0 - plddt, round(plddt.item(), 3)
+
+
+@R.register('GenPartpLDDT')
+class GenPartpLDDT(Objective):
+    '''
+        pLDDT of generated part
+    '''
+    def __call__(self, dict_out, feats, cplx_info: ComplexInfo):
+        plddt = dict_out['plddt'][0]    # assume batch size == 1
+        plddt = plddt[cplx_info.generate_mask[0].to(plddt.device)].mean()
+        return 1.0 - plddt, round(plddt.item(), 3)
+
 
 @R.register('ipLDDT')
 class ipLDDT(Objective):
@@ -57,6 +88,9 @@ class ipTM(Objective):
 
 @R.register('CPipTM')
 class CPipTM(Objective):
+    '''
+        Chain-Pair ipTM
+    '''
 
     def __init__(self, chain_pairs):
         super().__init__()
@@ -146,5 +180,7 @@ class Epitope(Objective):
         epi_x, gen_x = center_x[epi_mask], center_x[cplx_info.generate_mask[0]] # [Nres1, 3], #[Nres2, 3]
         dist = torch.norm(epi_x[:, None] - gen_x[None, :], dim=-1)    # [Nres1, Nres2]
         mink_dist = torch.topk(dist, k=self.k, dim=-1, largest=False)[0]
-        avg_dist = mink_dist.mean()
-        return avg_dist, round(avg_dist.item(), 2)
+        total_dist = mink_dist.sum()
+        return total_dist, round(total_dist.item(), 2)
+        # avg_dist = mink_dist.mean()
+        # return avg_dist, round(avg_dist.item(), 2)
