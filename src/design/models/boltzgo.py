@@ -15,6 +15,7 @@ from boltz.data.const import tokens, prot_token_to_letter
 from boltz.model.modules.diffusionv2 import *
 
 from design.utils.logger import print_log, cuda_memory_summary
+from design.utils.seed import get_rng_state, set_rng_state, setup_seed
 from .loss import parse_losses
 from .info import ComplexInfo
 
@@ -134,12 +135,14 @@ class BoltzGOConfig:
     inner_diffusion_steps: Optional[int] = None         # if none, use the default in Boltz2
     maintain_logits: bool = False                       # whether to keep the logits between outer loops. if true, the optimizer and the logits will be maintained
     use_history_best: bool = False                      # whether to use history best as starters for each outer loops
+    fix_inner_loop_seed: Optional[int] = None           # if None, do not fix seed
 
     init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0    # offset for the initial logits
 
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
+
 
     verbose: bool = False
 
@@ -870,6 +873,9 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                     while step < self.generator_config.max_inner_steps:
                         batch['res_type'] = normalize_prob(res_type.detach(), self.masks)
                         start = time.time()
+                        if self.generator_config.fix_inner_loop_seed is not None:
+                            rng_state = get_rng_state()
+                            setup_seed(self.generator_config.fix_inner_loop_seed)
                         out, loss_details = self(
                             batch,
                             recycling_steps=default(self.generator_config.inner_enc_recycling_steps, self.predict_args["recycling_steps"]),
@@ -878,6 +884,8 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                             max_parallel_samples=self.predict_args["max_parallel_samples"],
                             run_confidence_sequentially=True,
                         )
+                        if self.generator_config.fix_inner_loop_seed is not None:
+                            set_rng_state(rng_state)
                         loss_traj.append(loss_details)
                         with torch.set_grad_enabled(True):  # backward the normalize process
                             normalized_res_type = normalize_prob(res_type, self.masks)
