@@ -142,6 +142,7 @@ class BoltzGOConfig:
     init_scale: float = 6.0         # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0        # offset for the initial logits
     x_grad_scale: float = 1000.0    # gradient concerning structures will decay during backprop through diffusion, so we need to enlarge it
+    final_grad_rescale_factor: float = 1.0 # g = g * factor. it's better to control the grad norm between 1e-1 and 1e-2
 
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
@@ -891,12 +892,15 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                         if self.generator_config.maintain_logits:
                             self._res_type.grad = res_type.grad
                             res_type = self._res_type
-                        optimizer.step()
+                        # record grad norm
                         grad_norm = torch.linalg.norm(res_type.grad[self.masks], dim=-1).mean().item()
                         grad_norm_str = '{:.2e}'.format(grad_norm)
+                        res_type.grad = res_type.grad * self.generator_config.final_grad_rescale_factor
+                        rescale_prompt = ' ({:.2e} after rescale)'.format(torch.linalg.norm(res_type.grad[self.masks], dim=-1).mean().item())
+                        optimizer.step()
                         optimizer.zero_grad()
                         res_type[~self.masks] = original_res_type[~self.masks]
-                        print_log(f'inner step {step}, total loss {loss_details["total"]}, grad norm {grad_norm_str}, details {loss_details}, elapsed {round(time.time() - start, 2)}s')
+                        print_log(f'inner step {step}, total loss {loss_details["total"]}, grad norm {grad_norm_str}{rescale_prompt}, details {loss_details}, elapsed {round(time.time() - start, 2)}s')
                         if self.generator_config.verbose:
                             print_log(f'after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
                             print_log(f'after updates, self._res_tyoe {self._res_type[self.masks][0]}')
