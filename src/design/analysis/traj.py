@@ -23,6 +23,7 @@ def get_best(name, vals, largest=None):
             'pLDDT': True,
             'CPipTM': True,
             'FWAway': (True, False),
+            'FWAwayExp': (True, False),
             'Epitope': False,
             'total': False,
             'ChainpLDDT': True,
@@ -83,6 +84,8 @@ def load_traj(dir):
 def get_metric_val(d, name):
     if name == 'FWAway_dist': return d['FWAway'][0]
     elif name == 'FWAway_cnt': return d['FWAway'][1]
+    if name == 'FWAwayExp_dist': return d['FWAwayExp'][0]
+    elif name == 'FWAwayExp_cnt': return d['FWAwayExp'][1]
     return d[name]
 
 
@@ -111,6 +114,8 @@ def main(args):
     metrics = { name: [name] for name in traj[1][0] }
     if 'FWAway' in metrics:
         metrics['FWAway'] = ('FWAway_dist', 'FWAway_cnt')
+    if 'FWAwayExp' in metrics:
+        metrics['FWAwayExp'] = ('FWAwayExp_dist', 'FWAwayExp_cnt')
     for metric_type in metrics:
         for metric_name in metrics[metric_type]:
             x_name = 'round'
