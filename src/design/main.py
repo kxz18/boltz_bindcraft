@@ -20,6 +20,7 @@ def parse():
     parser.add_argument('--config', type=str, required=True, help='Path to the configurations')
     parser.add_argument('--out_dir', type=str, required=True, help='Output directory')
     parser.add_argument('--ckpt_dir', type=str, default='~/.boltz', help='Directory of the boltz checkpoints')
+    parser.add_argument('--max_num_trajectories', type=int, default=None, help='Maximum number of trajectories. If set to None, the program will keep running until a keyboard interrupt')
     return parser.parse_args()
 
 
@@ -52,36 +53,36 @@ def loss_to_prob(losses):
     return p
 
 
-def main(args):
+def run_design(config, out_dir, ckpt_dir):
     start = time.time()
     trainer, model_module, data_module, data_updater = prepare_boltz2(
-        data = args.config,
-        out_dir = args.out_dir,
-        cache = args.ckpt_dir,
+        data = config,
+        out_dir = out_dir,
+        cache = ckpt_dir,
         silent = True
     )
     print_log(f'Setting up additional configurations')
     model_module.init()
     model_module.eval()
-    model_module.setup_config(args.config)
+    model_module.setup_config(config)
     model_module.enable_param_gradients()
     model_module.set_mode_generation(True)
     print_log(f'Preparation elapsed {time.time() - start}s')
     if trainer is None: return
 
-    name = os.path.splitext(os.path.basename(args.config))[0]
+    name = os.path.splitext(os.path.basename(config))[0]
 
     rnd = 0
-    config_dir = os.path.join(args.out_dir, 'configs')
+    config_dir = os.path.join(out_dir, 'configs')
     os.makedirs(config_dir, exist_ok=True)
     config_path = os.path.join(config_dir, f'round{rnd}_0.yaml')
-    os.system(f'cp {args.config} {config_path}')
+    os.system(f'cp {config} {config_path}')
     # update config path
     manifest = data_updater([Path(config_path).expanduser()])
     data_module.manifest = manifest
     model_module.setup_config(config_path)
     # result dir
-    result_dir = os.path.join(args.out_dir, 'results')
+    result_dir = os.path.join(out_dir, 'results')
     os.makedirs(result_dir)
 
     loss_traj, new_res_types, history, history_configs = None, [None], {}, {}
@@ -118,7 +119,7 @@ def main(args):
             history[f'round{rnd}_{i}'] = (new_seqs, res['loss_details'])
             history_configs[f'round{rnd}_{i}'] = next_config_path
             # save the predictions to another place
-            os.system(f'mv {os.path.join(args.out_dir, f"boltz_results_{name}", "predictions", f"round{rnd}_{i}")} {os.path.join(rnd_res_dir, str(i))}')
+            os.system(f'mv {os.path.join(out_dir, f"boltz_results_{name}", "predictions", f"round{rnd}_{i}")} {os.path.join(rnd_res_dir, str(i))}')
         # save the loss trajectory
         if loss_traj is not None:
             with open(os.path.join(rnd_res_dir, 'loss_traj.json'), 'w') as fout: json.dump(loss_traj, fout, indent=2)
@@ -135,20 +136,18 @@ def main(args):
         else: patience -= 1
         print_log(f'Patience: {patience}')
         if patience <= 0:
-            print_log(f'Algorithm converged')
+            print_log(f'Algorithm converged. Early stop.')
             break
 
         # use the best one for next round
         config_path = os.path.join(config_dir, f'round{rnd}.yaml')
         if model_module.generator_config.use_history_best:
             # use history best for next round
-            # topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
             probs = loss_to_prob([history[sel_name][1]['total'] for sel_name in topk_history])
             print_log(f'Top-{len(topk_history)} probabilites as the starter for the next round: {[round(p, 2) for p in probs.tolist()]}')
             sel = np.random.choice(np.arange(len(topk_history)), p=probs, size=1)[0]
             sel_name = topk_history[sel]
             os.system(f'cp {history_configs[sel_name]} {config_path}')
-            # print_log(f'Best one in history ({best_i}) with loss: {history[best_i][1]}')
             print_log(f'Using the {sel}-th best one in history ({sel_name}) with loss: {history[sel_name][1]}')
         else:
             best_i = min(i2loss, key=lambda i: i2loss[i]['total'])
@@ -175,7 +174,6 @@ def main(args):
         )[0]
 
         loss_traj = res['loss_traj']    # update trajectory
-        # print_log(f'after optimization: {res["loss_details"]}')
         print_log(f'outer loop elapsed {round(time.time() - start, 2)}s')
         print()
 
@@ -183,18 +181,23 @@ def main(args):
         model_module.increase_outer_loop()
         # update sequence for the next round
         new_res_types = res['optimized_res_type']
-        # next_config_path = os.path.join(config_dir, f'round{rnd}.yaml')
-        # new_seqs = update_sequence_to_config(config_path, next_config_path, res['optimized_res_type'])
-        # config_path = next_config_path
-        # # update config path
-        # manifest = data_updater([Path(config_path).expanduser()])
-        # data_module.manifest = manifest
-        # model_module.setup_config(config_path)
 
         # start logging for next round
         print_log('=' * 20 + f'Round {rnd}' + '=' * 20)
-        # print_log(f'updated sequence: {new_seqs}')
 
+
+def main(args):
+    traj_cnt = 0
+    try:
+        while (args.max_num_trajectories is None) or (traj_cnt < args.max_num_trajectories):
+            print_log('=' * 30 + f' Running trajectory {traj_cnt} ' + '=' * 30)
+            out_dir = os.path.join(args.out_dir, f'trajectory{traj_cnt}')
+            run_design(args.config, out_dir, args.ckpt_dir)
+            # get some spaces between trajectories
+            for _ in range(10): print()
+            traj_cnt += 1
+    except KeyboardInterrupt:
+        print_log(f'Stopping due to keyboard interrupt')
 
 if __name__ == '__main__':
     main(parse())

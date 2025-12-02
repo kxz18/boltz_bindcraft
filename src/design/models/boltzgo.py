@@ -2,6 +2,7 @@
 # -*- coding:utf-8 -*-
 import gc
 import time
+import random
 from dataclasses import dataclass
 from typing import Any, Optional, Literal
 
@@ -137,7 +138,7 @@ class BoltzGOConfig:
     maintain_logits: bool = False                       # whether to keep the logits between outer loops. if true, the optimizer and the logits will be maintained. not recommended to be true as it easily leads to stuck in local optima
     use_history_best: bool = False                      # whether to use history best as starters for each outer loops
     history_best_topk: int = 1                          # random sample from topk best in history for outer loops
-    fix_inner_loop_seed: Optional[int] = None           # if None, do not fix seed
+    fix_inner_loop_seed: bool = True                    # whether to fix the seed for the inner loop (better to fix)
     inner_loop_best_as_output: bool = False
 
     init_scale: float = 6.0         # scale for the initial logits (one_hot * scale - offset for the softmax)
@@ -172,7 +173,9 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         self.outer_loop_count = 0
         # dynamic recording variables
         self._traj = []
-        
+        # seed for inner loop
+        self._inner_loop_seed = random.randint(0, 4294967295)
+        print_log(f'Random seed for inner loop if fix_inner_loop_seed is set to True: {self._inner_loop_seed}')
 
     def setup_config(
         self,
@@ -872,9 +875,9 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                     while step < self.generator_config.max_inner_steps:
                         batch['res_type'] = normalize_prob(res_type.detach(), self.masks)
                         start = time.time()
-                        if self.generator_config.fix_inner_loop_seed is not None:
+                        if self.generator_config.fix_inner_loop_seed:
                             rng_state = get_rng_state()
-                            setup_seed(self.generator_config.fix_inner_loop_seed)
+                            setup_seed(self._inner_loop_seed)
                         out, loss_details = self(
                             batch,
                             recycling_steps=default(self.generator_config.inner_enc_recycling_steps, self.predict_args["recycling_steps"]),
@@ -883,7 +886,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                             max_parallel_samples=self.predict_args["max_parallel_samples"],
                             run_confidence_sequentially=True,
                         )
-                        if self.generator_config.fix_inner_loop_seed is not None:
+                        if self.generator_config.fix_inner_loop_seed:
                             set_rng_state(rng_state)
                         loss_traj.append(loss_details)
                         with torch.set_grad_enabled(True):  # backward the normalize process

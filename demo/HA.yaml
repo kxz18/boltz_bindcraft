@@ -22,21 +22,42 @@ generator:
     lr: 1.0
     max_inner_steps: 10
     max_outer_steps: 100
-    # inner_enc_recycling_steps: 0
-    # inner_diffusion_steps: 20
+    inner_enc_recycling_steps: 1
+    inner_diffusion_steps: 100
     sample_k: 5
+    sample_method: multinomial  # or argmax with sample_k = 1
+    # sample_k: 1
+    # sample_method: argmax
+    use_history_best: true
+    history_best_topk: 3
+    maintain_logits: false
+    fix_inner_loop_seed: true
+    x_grad_scale: 1000.0
+    final_grad_rescale_factor: 1.0
+    inner_loop_best_as_output: true
+    verbose: false
   loss:
     - class: pLDDT
+      weight: 0.1
+    - class: ChainpLDDT
+      selected_chains: [H]
+      weight: 0.3
+    - class: GenPartpLDDT
       weight: 0.5
     - class: CPipTM
       chain_pairs: [[A, H], [B, H]]
-      weight: 0.0
-    - class: FWAway
+      weight: 0.05
+    # - class: FWAway
+    #   binder_chains: [H]
+    #   contact_th: 10.0
+    #   weight: 1.0
+    - class: FWAwayExp
       binder_chains: [H]
-      contact_th: 10.0
+      contact_th: 8.0
       weight: 1.0
     - class: Epitope
       epitope: [[B, 11], [B, 32], [B, 35]]
+      # normalize_scale: 1.0
       weight: 1.0
   masks:
     H: "000000000000000000000011111111100000000000000000111111000000000000000000001111111111000000000000000"
