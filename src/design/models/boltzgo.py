@@ -145,12 +145,11 @@ class BoltzGOConfig:
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
 
-
     verbose: bool = False
-
+    print_history_topk: int = 5
 
     def check_validity(self):
-        if self.use_history_best: assert not self.maintain_logits, f'use_history_best={self.use_history_best} is not compatible with maintain_logits={self.maintain_logits}'
+        # if self.use_history_best: assert not self.maintain_logits, f'use_history_best={self.use_history_best} is not compatible with maintain_logits={self.maintain_logits}'
         assert self.sample_method in ['multinomial', 'argmax'], f'sample_method {self.sample_method} not recognized.'
         if self.sample_method == 'argmax': assert self.sample_k == 1, f'sample_k should be 1 with sample_method={self.sample_method}'
 

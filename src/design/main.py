@@ -119,7 +119,8 @@ def main(args):
         config_path = os.path.join(config_dir, f'round{rnd}.yaml')
         if model_module.generator_config.use_history_best:
             # use history best for next round
-            topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
+            # topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
+            topk_history = list(history.keys())[:model_module.generator_config.history_best_topk]
             sel = random.randint(0, len(topk_history) - 1)
             sel_name = topk_history[sel]
             os.system(f'cp {history_configs[sel_name]} {config_path}')
@@ -130,7 +131,7 @@ def main(args):
             os.system(f'cp {i2config[best_i]} {config_path}')
             print_log(f'Best one in this loop ({best_i}) with loss: {i2loss[i]}')
         # get topk in the history
-        topk = 5
+        topk = model_module.generator_config.print_history_topk
         print_log(f'History top {topk}')
         for i, cid in enumerate(history):
             if i == topk: break
