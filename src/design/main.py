@@ -132,7 +132,7 @@ def main(args):
             # topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
             topk_history = list(history.keys())[:model_module.generator_config.history_best_topk]
             probs = loss_to_prob([history[sel_name][1]['total'] for sel_name in topk_history])
-            print_log(f'Top-{len(topk_history)} probabilites as the starter for the next round: {probs.tolist()}')
+            print_log(f'Top-{len(topk_history)} probabilites as the starter for the next round: {[round(p, 2) for p in probs.tolist()]}')
             sel = np.random.choice(np.arange(len(topk_history)), p=probs, size=1)[0]
             sel_name = topk_history[sel]
             os.system(f'cp {history_configs[sel_name]} {config_path}')
