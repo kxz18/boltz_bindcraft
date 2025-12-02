@@ -137,6 +137,7 @@ class BoltzGOConfig:
     use_history_best: bool = False                      # whether to use history best as starters for each outer loops
     history_best_topk: int = 1                          # random sample from topk best in history for outer loops
     fix_inner_loop_seed: Optional[int] = None           # if None, do not fix seed
+    inner_loop_best_as_output: bool = False
 
     init_scale: float = 6.0         # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0        # offset for the initial logits
@@ -862,16 +863,10 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                 else:   # do generation
                     step = 0
                     res_type, optimizer = self._initialize(batch)
-                    # res_type = batch['res_type'].detach().float().requires_grad_(True)
-                    # with torch.no_grad():
-                    #     if self.outer_loop_count == 0:  # the initial round
-                    #         res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
-                    #     else:
-                    #         res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
-                    # optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
                     if self.generator_config.verbose:
                         print_log(f'initialize, residues {res_type[self.masks][0]}')
                     loss_traj = []
+                    best_loss, best_step, best_res_type = 1e10, None, None
                     while step < self.generator_config.max_inner_steps:
                         batch['res_type'] = normalize_prob(res_type.detach(), self.masks)
                         start = time.time()
@@ -905,7 +900,13 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
                         if self.generator_config.verbose:
                             print_log(f'after updates, residues {res_type[self.masks][0]}, normalized {normalized_res_type[self.masks][0]}')
                             print_log(f'after updates, self._res_tyoe {self._res_type[self.masks][0]}')
+                        if loss_details['total'] < best_loss:
+                            best_loss, best_step, best_res_type = loss_details['total'], step, res_type.clone()
                         step += 1
+                    if self.generator_config.inner_loop_best_as_output:
+                        print_log(f'Using logits from step {best_step} as output due to its lowest loss')
+                        res_type = best_res_type
+
             pred_dict = {"exception": False}
             if "keys_dict_batch" in self.predict_args:
                 for key in self.predict_args["keys_dict_batch"]:
