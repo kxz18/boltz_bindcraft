@@ -8,6 +8,8 @@ import random
 import argparse
 from pathlib import Path
 
+import numpy as np
+
 from .utils.logger import print_log
 from .utils.boltz_utils import prepare_boltz2
 
@@ -40,6 +42,14 @@ def update_sequence_to_config(src_path, dst_path, res_type):
     with open(dst_path, 'w') as fout: yaml.dump(config, fout)
 
     return new_seqs
+
+
+def loss_to_prob(losses):
+    losses = np.array(losses)
+    p = losses - losses.mean()
+    p = 1 / np.exp(p)
+    p = p / p.sum()
+    return p
 
 
 def main(args):
@@ -121,7 +131,9 @@ def main(args):
             # use history best for next round
             # topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
             topk_history = list(history.keys())[:model_module.generator_config.history_best_topk]
-            sel = random.randint(0, len(topk_history) - 1)
+            probs = loss_to_prob([history[sel_name][1]['total'] for sel_name in topk_history])
+            print_log(f'Top-{len(topk_history)} probabilites as the starter for the next round: {probs.tolist()}')
+            sel = np.random.choice(np.arange(len(topk_history)), p=probs, size=1)[0]
             sel_name = topk_history[sel]
             os.system(f'cp {history_configs[sel_name]} {config_path}')
             # print_log(f'Best one in history ({best_i}) with loss: {history[best_i][1]}')
