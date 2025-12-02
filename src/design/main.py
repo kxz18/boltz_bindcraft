@@ -4,8 +4,7 @@ import os
 import yaml
 import time
 import json
-import shutil
-import tempfile
+import random
 import argparse
 from pathlib import Path
 
@@ -120,9 +119,12 @@ def main(args):
         config_path = os.path.join(config_dir, f'round{rnd}.yaml')
         if model_module.generator_config.use_history_best:
             # use history best for next round
-            best_i = min(history, key=lambda i: history[i][1]['total'])
-            os.system(f'cp {history_configs[best_i]} {config_path}')
-            print_log(f'Best one in history ({best_i}) with loss: {history[best_i][1]}')
+            topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
+            sel = random.randint(0, len(topk_history) - 1)
+            sel_name = topk_history[sel]
+            os.system(f'cp {history_configs[sel_name]} {config_path}')
+            # print_log(f'Best one in history ({best_i}) with loss: {history[best_i][1]}')
+            print_log(f'Using the {sel}-th best one in history ({sel_name}) with loss: {history[sel_name][1]}')
         else:
             best_i = min(i2loss, key=lambda i: i2loss[i]['total'])
             os.system(f'cp {i2config[best_i]} {config_path}')
