@@ -85,6 +85,7 @@ def main(args):
     os.makedirs(result_dir)
 
     loss_traj, new_res_types, history, history_configs = None, [None], {}, {}
+    patience = model_module.generator_config.converge_patience
     # Compute structure predictions
     while rnd < model_module.generator_config.max_outer_steps:
         # do structure prediction
@@ -124,13 +125,24 @@ def main(args):
         # save history records
         history = dict(sorted(history.items(), key=lambda x: x[1][1]['total'])) # sort by loss
         with open(os.path.join(result_dir, 'history.json'), 'w') as fout: json.dump(history, fout, indent=2)
+        topk_history = list(history.keys())[:model_module.generator_config.history_best_topk]
+
+        # check convergence
+        updated = (rnd == 0)    # skip check for the first round
+        for history_name in topk_history:
+            if f'round{rnd}_' in history_name: updated = True
+        if updated: patience = model_module.generator_config.converge_patience
+        else: patience -= 1
+        print_log(f'Patience: {patience}')
+        if patience <= 0:
+            print_log(f'Algorithm converged')
+            break
 
         # use the best one for next round
         config_path = os.path.join(config_dir, f'round{rnd}.yaml')
         if model_module.generator_config.use_history_best:
             # use history best for next round
             # topk_history = sorted(history, key=lambda i: history[i][1]['total'])[:model_module.generator_config.history_best_topk]
-            topk_history = list(history.keys())[:model_module.generator_config.history_best_topk]
             probs = loss_to_prob([history[sel_name][1]['total'] for sel_name in topk_history])
             print_log(f'Top-{len(topk_history)} probabilites as the starter for the next round: {[round(p, 2) for p in probs.tolist()]}')
             sel = np.random.choice(np.arange(len(topk_history)), p=probs, size=1)[0]
