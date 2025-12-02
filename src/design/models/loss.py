@@ -148,15 +148,44 @@ class FWAway(Objective):
         contact_dist = mink_dist[contact].sum()
         loss = self.contact_th * contact.sum() - contact_dist
         return loss, (round(contact_dist.item(), 2), cnt)
+
+
+@R.register('FWAwayExp')
+class FWAwayExp(Objective):
+
+    '''
+        e^{(th - d) / beta}
+    '''
+
+    def __init__(self, binder_chains, contact_th=8.0, beta=2.0, k=3):
+        super().__init__()
+        self.binder_chains = binder_chains
+        self.contact_th = contact_th
+        self.beta = beta
+        self.k = k  # for each residue in framework, consider the nearest k residues in the target protein
+
+    def __call__(self, dict_out, feats, cplx_info: ComplexInfo):
+        token_to_center_atom_idx = torch.argmax(feats['token_to_center_atom'], dim=-1)[0]  # [Nres], assume batch size = 1
+        center_x = dict_out['sample_atom_coords'][0][token_to_center_atom_idx] # [Nres]
+        cplx_info.generate_mask = cplx_info.generate_mask.to(center_x.device)
+        binder_mask = torch.tensor([(True if c in self.binder_chains else False) for c in cplx_info.chain_ids], dtype=bool, device=center_x.device)
+        target_x, fw_x = center_x[~binder_mask], center_x[binder_mask & (~cplx_info.generate_mask[0])] # [Nres1, 3], #[Nres2, 3]
+        dist = torch.norm(fw_x[:, None] - target_x[None, :], dim=-1)    # [Nres1, Nres2]
+        mink_dist = torch.topk(dist, k=self.k, dim=-1, largest=False)[0]    # [Nres1, k]
+        loss = torch.exp(1.0 / self.beta * (self.contact_th - mink_dist)).mean()
+        contact = mink_dist < self.contact_th
+        cnt = contact.sum(-1).bool().sum().item()
+        return loss, (round(mink_dist.mean().item(), 2), cnt)
     
 
 @R.register('Epitope')
 class Epitope(Objective):
 
-    def __init__(self, epitope: list, k: int=3):
+    def __init__(self, epitope: list, k: int=3, normalize_scale: float=8.0):
         super().__init__()
         self.epitope = epitope  # e.g. [[A, 105], [A, 117], [A, 168], [B, 200]]
         self.k = k
+        self.normalize_scale = 1.0 / normalize_scale
     
     def __call__(self, dict_out, feats, cplx_info: ComplexInfo):
         # prepare
@@ -180,7 +209,7 @@ class Epitope(Objective):
         epi_x, gen_x = center_x[epi_mask], center_x[cplx_info.generate_mask[0]] # [Nres1, 3], #[Nres2, 3]
         dist = torch.norm(epi_x[:, None] - gen_x[None, :], dim=-1)    # [Nres1, Nres2]
         mink_dist = torch.topk(dist, k=self.k, dim=-1, largest=False)[0]
-        total_dist = mink_dist.sum()
-        return total_dist, round(total_dist.item(), 2)
-        # avg_dist = mink_dist.mean()
-        # return avg_dist, round(avg_dist.item(), 2)
+        # total_dist = mink_dist.sum()
+        # return total_dist, round(total_dist.item(), 2)
+        avg_dist = mink_dist.mean()
+        return avg_dist * self.normalize_scale, round(avg_dist.item(), 2)

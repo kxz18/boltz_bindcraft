@@ -135,10 +135,12 @@ class BoltzGOConfig:
     inner_diffusion_steps: Optional[int] = None         # if none, use the default in Boltz2
     maintain_logits: bool = False                       # whether to keep the logits between outer loops. if true, the optimizer and the logits will be maintained
     use_history_best: bool = False                      # whether to use history best as starters for each outer loops
+    history_best_topk: int = 1                          # random sample from topk best in history for outer loops
     fix_inner_loop_seed: Optional[int] = None           # if None, do not fix seed
 
-    init_scale: float = 6.0     # scale for the initial logits (one_hot * scale - offset for the softmax)
-    init_offset: float = 3.0    # offset for the initial logits
+    init_scale: float = 6.0         # scale for the initial logits (one_hot * scale - offset for the softmax)
+    init_offset: float = 3.0        # offset for the initial logits
+    x_grad_scale: float = 1000.0    # gradient concerning structures will decay during backprop through diffusion, so we need to enlarge it
 
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
@@ -798,6 +800,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         feats['res_type'] = res_type
         with torch.set_grad_enabled(True):
             dict_out.update(self._confidence(s_inputs, s, z, pdistogram, atom_coords, feats, diffusion_samples, run_confidence_sequentially))
+            dict_out['sample_atom_coords'] = atom_coords
             loss, loss_details = self.get_loss(dict_out, feats)
             dx, ds_inputs, ds, dz, dd, dres_type = torch.autograd.grad(loss, [atom_coords, s_inputs, s, z, pdistogram, res_type], retain_graph=False, allow_unused=True)
             # TODO: problem: why no grad to dx? x is discretized into pdistograms which are later added to z
@@ -807,7 +810,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
         if ds is None: ds = torch.zeros_like(s)
         if ds_inputs is None: ds_inputs = torch.zeros_like(s_inputs)
         vs, vs_inputs, dq, dc, datom_enc_bias, datom_dec_bias, dtoken_trans_bias = self._diffusion_sample_backward(
-            dx=dx,
+            dx=dx * self.generator_config.x_grad_scale,
             s_trunk=s.float(),
             s_inputs=s_inputs.float(),
             feats=feats,
