@@ -18,3 +18,11 @@ matplotlib, seaborn
 ```bash
 python -m design.analysis.traj --res_dir ../tmp/HA-stem
 ```
+
+ray, biotite
+
+for af3 server
+
+```bash
+python -m af3.struct_server --task_dir ../../tmp/
+```
