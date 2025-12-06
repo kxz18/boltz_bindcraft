@@ -46,8 +46,8 @@ class StructPredTask:
             if chain.msa_path == '':
                 info['unpairedMsa'], info['pairedMsa'] = '', ''
             elif chain.msa_path is not None:
-                info['unpairedMsaPath'] = os.path.abspath(chain.msa_path) 
-                info['pairedMsaPath'] = ''
+                info['unpairedMsaPath'] = os.path.abspath(chain.msa_path[0]) 
+                info['pairedMsaPath'] = os.path.abspath(chain.msa_path[1])
             if chain.templates is not None:
                 if len(chain.templates) == 0: info['templates'] = []    # disable template
                 else:

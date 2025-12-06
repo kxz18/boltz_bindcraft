@@ -26,3 +26,10 @@ for af3 server
 ```bash
 python -m af3.struct_server --task_dir ../../tmp/
 ```
+
+
+rmsd ratio:
+
+```bash
+python -m design.analysis.scrmsd_ratio --res_dir ../tmp/HA-stem/HA-stem_0 --tgt_chains AB --lig_chains H
+```

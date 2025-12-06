@@ -114,7 +114,7 @@ def form_task(json_path, model):
     return task
 
 
-def recursive_scan(template_dir, template_history, dir, prefix, visited, tasks, max_queue_size=100, model='AF3'):
+def recursive_scan(chain2msa_paths, template_dir, template_history, dir, prefix, visited, tasks, max_queue_size=100, model='AF3'):
     if len(tasks) >= max_queue_size: return
     loss_traj = os.path.join(dir, 'loss_traj.json')
     if os.path.exists(loss_traj):
@@ -136,11 +136,13 @@ def recursive_scan(template_dir, template_history, dir, prefix, visited, tasks, 
                     chain2template_cif[c1] = (c2, item['cif'])
             construct_input_json(
                 chain2seqs={ item['protein']['id']: item['protein']['sequence'] for item in config['sequences'] },
+                chain2msa_paths=chain2msa_paths,
                 chain2template_cif=chain2template_cif,
                 template_dir=template_dir,
                 template_history=template_history,
                 task_name='AF3',
-                out_dir=af3_dir
+                out_dir=af3_dir,
+                n_seeds=5   # stable results
             )
             # append task
             task = form_task(os.path.join(af3_dir, 'AF3.json'), model)
@@ -151,11 +153,11 @@ def recursive_scan(template_dir, template_history, dir, prefix, visited, tasks, 
         # loop all the subdirs
         for subdir in os.listdir(dir):
             print_log(f'Descending into directory {os.path.join(dir, subdir)}', level='DEBUG')
-            recursive_scan(template_dir, template_history, os.path.join(dir, subdir), prefix + [subdir], visited, tasks, max_queue_size, model)
+            recursive_scan(chain2msa_paths, template_dir, template_history, os.path.join(dir, subdir), prefix + [subdir], visited, tasks, max_queue_size, model)
             if len(tasks) >= max_queue_size: return
 
 
-def scan_tasks(dir, visited, model):
+def scan_tasks(dir, visited, model, chain2msa_paths):
     template_dir = os.path.join(dir, 'af3_templates')
     os.makedirs(template_dir, exist_ok=True)
     template_history_path = os.path.join(template_dir, 'template_history.json')
@@ -164,6 +166,7 @@ def scan_tasks(dir, visited, model):
 
     tasks = []
     recursive_scan(
+        chain2msa_paths=chain2msa_paths,
         template_dir=template_dir,
         template_history=template_history,
         dir=dir,
@@ -182,11 +185,13 @@ def main(args):
     print_log('Ray initialized')
     idling_start = None
     finish_cnt = 0
+    if args.msa_config is None: chain2msa_paths = {}
+    else: chain2msa_paths = json.load(open(args.msa_config, 'r'))
     try:
         futures, visited = [], {}
         while True:
             print_log(f'Start scanning {args.task_dir}')
-            tasks = scan_tasks(args.task_dir, visited, args.model)
+            tasks = scan_tasks(args.task_dir, visited, args.model, chain2msa_paths)
             # for task in tasks: futures.append(run.remote(task))
             futures.extend(tasks)
             if len(tasks) > 0:
@@ -223,6 +228,7 @@ def parse():
     parser = argparse.ArgumentParser(description='AF3 server')
     parser.add_argument('--task_dir', type=str, required=True, help='Directory to store tasks')
     parser.add_argument('--model', type=str, choices=['AF3'], default='AF3')
+    parser.add_argument('--msa_config', type=str, default=None, help='Json file of chain to msa paths (unpaired, paired)')
     return parser.parse_args()
 
 

@@ -91,7 +91,7 @@ def iterable_equal(l1, l2):
     return equal
 
 
-def construct_input_json(chain2seqs, chain2template_cif, template_dir, template_history, task_name, out_dir):
+def construct_input_json(chain2seqs, chain2msa_paths, chain2template_cif, template_dir, template_history, task_name, out_dir, n_seeds=1):
 
     chains = []
     for c in chain2seqs:
@@ -112,7 +112,7 @@ def construct_input_json(chain2seqs, chain2template_cif, template_dir, template_
         chains.append(ChainData(
             id=c,
             sequence=seq,
-            msa_path='',    # stop msa
+            msa_path=chain2msa_paths.get(c, ''),    # stop msa
             templates=template_data
         ))
     
@@ -122,4 +122,4 @@ def construct_input_json(chain2seqs, chain2template_cif, template_dir, template_
         props={}
     )
 
-    task.to_af3_json(out_dir)
+    task.to_af3_json(out_dir, n_seeds=n_seeds)
