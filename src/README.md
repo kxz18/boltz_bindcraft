@@ -28,8 +28,8 @@ python -m af3.struct_server --task_dir ../../tmp/
 ```
 
 
-rmsd ratio:
+distribution of metrics:
 
 ```bash
-python -m design.analysis.scrmsd_ratio --res_dir ../tmp/HA-stem/HA-stem_0 --tgt_chains AB --lig_chains H
+python -m design.analysis.metrics --res_dir ../tmp/HA-stem/HA-stem_0 --tgt_chains AB --lig_chains H
 ```
