@@ -8,10 +8,12 @@ import random
 import argparse
 from pathlib import Path
 
+import ray
 import numpy as np
 
 from .utils.logger import print_log
 from .utils.boltz_utils import prepare_boltz2
+from .af3.rectification import af3_rectification
 
 
 
@@ -21,6 +23,7 @@ def parse():
     parser.add_argument('--out_dir', type=str, required=True, help='Output directory')
     parser.add_argument('--ckpt_dir', type=str, default='~/.boltz', help='Directory of the boltz checkpoints')
     parser.add_argument('--max_num_trajectories', type=int, default=None, help='Maximum number of trajectories. If set to None, the program will keep running until a keyboard interrupt')
+    parser.add_argument('--af3_msa_config', type=str, default=None, help='Path to MSA configurations for AF3 rectification')
     return parser.parse_args()
 
 
@@ -53,7 +56,7 @@ def loss_to_prob(losses):
     return p
 
 
-def run_design(config, out_dir, ckpt_dir):
+def run_design(config, out_dir, ckpt_dir, af3_msa_config):
     start = time.time()
     trainer, model_module, data_module, data_updater = prepare_boltz2(
         data = config,
@@ -69,6 +72,13 @@ def run_design(config, out_dir, ckpt_dir):
     model_module.set_mode_generation(True)
     print_log(f'Preparation elapsed {time.time() - start}s')
     if trainer is None: return
+
+    if model_module.generator_config.af3_rect_freq > 0:
+        ray.init(
+            include_dashboard=False,
+            logging_level='error',
+            ignore_reinit_error=True,
+        )
 
     name = os.path.splitext(os.path.basename(config))[0]
 
@@ -141,7 +151,15 @@ def run_design(config, out_dir, ckpt_dir):
 
         # use the best one for next round
         config_path = os.path.join(config_dir, f'round{rnd}.yaml')
-        if model_module.generator_config.use_history_best:
+        af3_rect_freq = model_module.generator_config.af3_rect_freq
+        if (af3_rect_freq > 0) and (rnd > 0) and (rnd % af3_rect_freq == 0):
+            # AF3 rectification
+            print_log(f'Round {rnd}, entering AF3 orthogonal rectification')
+            rect_topk = model_module.generator_config.sample_k
+            sel_name, scrmsd = af3_rectification(history, history_configs, rect_topk, out_dir, af3_msa_config)
+            os.system(f'cp {history_configs[sel_name]} {config_path}')
+            print_log(f'Using {sel_name}, the one with best scRMSD ({round(scrmsd, 2)}) among top-{rect_topk} for the next round')
+        elif model_module.generator_config.use_history_best:
             # use history best for next round
             probs = loss_to_prob([history[sel_name][1]['total'] for sel_name in topk_history])
             print_log(f'Top-{len(topk_history)} probabilites as the starter for the next round: {[round(p, 2) for p in probs.tolist()]}')
@@ -189,10 +207,13 @@ def run_design(config, out_dir, ckpt_dir):
 def main(args):
     traj_cnt = 0
     try:
+        os.makedirs(args.out_dir, exist_ok=True)
+        base_config = os.path.join(args.out_dir, 'base_config.yaml')
+        os.system(f'cp {args.config} {base_config}')
         while (args.max_num_trajectories is None) or (traj_cnt < args.max_num_trajectories):
             print_log('=' * 30 + f' Running trajectory {traj_cnt} ' + '=' * 30)
             out_dir = os.path.join(args.out_dir, f'trajectory{traj_cnt}')
-            run_design(args.config, out_dir, args.ckpt_dir)
+            run_design(base_config, out_dir, args.ckpt_dir, args.af3_msa_config)
             # get some spaces between trajectories
             for _ in range(10): print()
             traj_cnt += 1

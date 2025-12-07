@@ -11,9 +11,8 @@ from dataclasses import dataclass
 
 import ray
 
-from utils.logger import print_log
-
 from .constructor import construct_input_json
+from ..utils.logger import print_log
 
 
 @dataclass
@@ -123,6 +122,8 @@ def recursive_scan(chain2msa_paths, template_dir, template_history, dir, prefix,
             full_path = os.path.join(dir, n)
             if (full_path in visited) or os.path.isfile(full_path): continue
             af3_dir = os.path.join(full_path, 'af3')
+            status_file = os.path.join(af3_dir, 'logs', 'AF3', '_STATUS')
+            if os.path.exists(status_file) and (open(status_file, 'r').read().rstrip() == 'SUCCEEDED'): continue # already finished
             if os.path.exists(af3_dir):
                 shutil.rmtree(af3_dir)
             os.makedirs(af3_dir, exist_ok=True)
