@@ -3,7 +3,7 @@
 import gc
 import time
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, Literal
 
 import yaml
@@ -152,7 +152,7 @@ class BoltzGOConfig:
 
     af3_rect_freq: int = 0      # using AF3 for rectification of the top sample_k candidates, and select the one with the lowest scRMSD for next round. If set to 0, disable this mechanism
 
-    disallow_aas: list = ['CYS']  # do not generate the residues in this list
+    disallow_aas: list = field(default_factory=lambda: ['CYS'])  # do not generate the residues in this list
 
     verbose: bool = False
     print_history_topk: int = 5
