@@ -38,8 +38,9 @@ def normalize_prob(p, m):
     return p
 
 
-def logits_to_types(logits, generate_mask, k=1, sample_method='multinomial'):
-    mask = [(0 if ((name not in prot_token_to_letter) or (name == 'UNK') or (name == '-')) else 1) for name in tokens]
+def logits_to_types(logits, generate_mask, k=1, sample_method='multinomial', disallow_aas=None):
+    if disallow_aas is None: disallow_aas = []
+    mask = [(0 if ((name not in prot_token_to_letter) or (name == 'UNK') or (name == '-') or (name in disallow_aas)) else 1) for name in tokens]
     mask = torch.tensor(mask, dtype=bool, device=logits.device)
     generate_mask = generate_mask.to(logits.device)
     logits = logits.masked_fill((~mask[None, None, :]) & generate_mask.unsqueeze(-1), float('-inf'))
@@ -148,6 +149,10 @@ class BoltzGOConfig:
 
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
+
+    af3_rect_freq: int = 0      # using AF3 for rectification of the top sample_k candidates, and select the one with the lowest scRMSD for next round. If set to 0, disable this mechanism
+
+    disallow_aas: list = ['CYS']  # do not generate the residues in this list
 
     verbose: bool = False
     print_history_topk: int = 5
@@ -973,7 +978,7 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
             pred_dict['loss_details'] = out['loss_details']
             if self.is_generation:
                 pred_dict['optimized_res_logits'] = res_type
-                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks, self.generator_config.sample_k, self.generator_config.sample_method)
+                pred_dict['optimized_res_type'] = logits_to_types(res_type, self.masks, self.generator_config.sample_k, self.generator_config.sample_method, self.generator_config.disallow_aas)
                 pred_dict['loss_traj'] = loss_traj
             return pred_dict
 
