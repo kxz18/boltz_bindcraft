@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 import ray
 
+from .af3_utils import cleanup_output
 from .constructor import construct_input_json
 from ..utils.logger import print_log
 
@@ -25,6 +26,7 @@ class Task:
     exit_code: int = 0
     elapsed_time: int = 0
     model: str = 'AF3'
+    cleanup: bool = True
 
 
 def af3_cmd(gpu_ids, input_path, out_dir):
@@ -84,6 +86,11 @@ def run(task: Task):
         # add file marker
         marker = 'SUCCEEDED' if task.exit_code == 0 else 'FAILED'
         with open(task.status_file, 'w') as fout: fout.write(marker + '\n')
+        # cleanup
+        if task.cleanup:
+            cleanup_output(os.path.join(out_dir, name))
+            msa_dir = os.path.join(out_dir, '..', 'msas')
+            if os.path.exists(msa_dir): shutil.rmtree(msa_dir)
     except Exception as e:
         print_log(f'task {task.id} failed due to: {e}', level='ERROR')
         task.exit_code = 1
@@ -118,7 +125,9 @@ def recursive_scan(chain2msa_paths, template_dir, template_history, dir, prefix,
     loss_traj = os.path.join(dir, 'loss_traj.json')
     if os.path.exists(loss_traj):
         print_log(f'getting tasks from {dir}', level='DEBUG')
-        for n in os.listdir(dir):
+        try: dirs = list(os.listdir(dir))
+        except Exception: return
+        for n in dirs:
             full_path = os.path.join(dir, n)
             if (full_path in visited) or os.path.isfile(full_path): continue
             af3_dir = os.path.join(full_path, 'af3')

@@ -4,6 +4,8 @@
 # -*- coding:utf-8 -*-
 import os
 import json
+import shutil
+
 import numpy as np
 
 from ..data.bioparse.parser.mmcif_to_complex import mmcif_to_complex
@@ -94,3 +96,16 @@ def get_scRMSD(ref_path, model_path, tgt_chains, lig_chains, gen_mask=None, alig
     else: gen_sc_rmsd = None
     
     return sc_rmsd, gen_sc_rmsd
+
+
+def cleanup_output(output_dir):
+    if not os.path.exists(output_dir): return
+    to_del = []
+    for fname in os.listdir(output_dir):
+        if fname.endswith('_model.cif'): continue               # the final structure
+        elif fname.endswith('_confidences.json'): continue      # the confidences
+        to_del.append(fname)
+    for fname in to_del:
+        path = os.path.join(output_dir, fname)
+        if os.path.isdir(path): shutil.rmtree(path)
+        else: os.remove(path)

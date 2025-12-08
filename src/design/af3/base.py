@@ -27,6 +27,12 @@ class ChainData:
     templates: Optional[List[TemplateData]] = None  # if disabled, set to []
 
 
+def msa_change_query_seq(in_path, out_path, seq):
+    with open(in_path, 'r') as fin: lines = fin.readlines()
+    lines[1] = seq + '\n'
+    with open(out_path, 'w') as fout: fout.writelines(lines)
+
+
 @dataclass
 class StructPredTask:
     name: str
@@ -36,6 +42,8 @@ class StructPredTask:
     def to_af3_json(self, out_dir, suffix='', include_chains=None, n_seeds=1):
         if include_chains is None: include_chains = [c.id for c in self.chains]
         data = []
+        msa_dir = os.path.join(out_dir, 'msas', self.name + suffix)
+        os.makedirs(msa_dir, exist_ok=True)
 
         for chain in self.chains:
             if chain.id not in include_chains: continue
@@ -46,8 +54,12 @@ class StructPredTask:
             if chain.msa_path == '':
                 info['unpairedMsa'], info['pairedMsa'] = '', ''
             elif chain.msa_path is not None:
-                info['unpairedMsaPath'] = os.path.abspath(chain.msa_path[0]) 
-                info['pairedMsaPath'] = os.path.abspath(chain.msa_path[1])
+                unpaired_path = os.path.abspath(os.path.join(msa_dir, f'unpaired_{chain.id}.a3m'))
+                paired_path = os.path.abspath(os.path.join(msa_dir, f'paired_{chain.id}.a3m'))
+                msa_change_query_seq(chain.msa_path[0], unpaired_path, chain.sequence)
+                msa_change_query_seq(chain.msa_path[1], paired_path, chain.sequence)
+                info['unpairedMsaPath'] = unpaired_path
+                info['pairedMsaPath'] = paired_path
             if chain.templates is not None:
                 if len(chain.templates) == 0: info['templates'] = []    # disable template
                 else:
