@@ -109,3 +109,23 @@ def cleanup_output(output_dir):
         path = os.path.join(output_dir, fname)
         if os.path.isdir(path): shutil.rmtree(path)
         else: os.remove(path)
+
+
+def load_af3_metrics(candidate_dir, tgt_chains, lig_chains, iptm_row_cols):
+    save_path = os.path.join(candidate_dir, 'af3', 'metrics.json')
+    try:
+        af3_confidences = json.load(open(save_path, 'r'))
+        return af3_confidences
+    except Exception: pass
+    # process
+    confidence_path = os.path.join(candidate_dir, 'af3', 'output', 'AF3', 'AF3_summary_confidences.json')
+    af3_confidences = load_confidences(confidence_path, tgt_chains, lig_chains, iptm_row_cols)
+    if af3_confidences is None: return None
+    af3_model_path = os.path.join(candidate_dir, 'af3', 'output', 'AF3', 'AF3_model.cif')
+    for fname in os.listdir(candidate_dir):
+        if fname.endswith('.cif'): break
+    ref_path = os.path.join(candidate_dir, fname)
+    sc_rmsd, _ = get_scRMSD(ref_path, af3_model_path, tgt_chains, lig_chains)
+    af3_confidences['scRMSD'] = sc_rmsd
+    json.dump(af3_confidences, open(save_path, 'w'), indent=2)
+    return af3_confidences

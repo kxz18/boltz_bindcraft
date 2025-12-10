@@ -73,12 +73,12 @@ def run_design(config, out_dir, ckpt_dir, af3_msa_config):
     print_log(f'Preparation elapsed {time.time() - start}s')
     if trainer is None: return
 
-    if model_module.generator_config.af3_rect_freq > 0:
-        ray.init(
-            include_dashboard=False,
-            logging_level='error',
-            ignore_reinit_error=True,
-        )
+    # if model_module.generator_config.af3_rect_freq > 0:
+    #     ray.init(
+    #         include_dashboard=False,
+    #         logging_level='error',
+    #         ignore_reinit_error=True,
+    #     )
 
     name = os.path.splitext(os.path.basename(config))[0]
 

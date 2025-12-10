@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import ray
 
-from .af3_utils import cleanup_output
+from .af3_utils import cleanup_output, load_af3_metrics
 from .constructor import construct_input_json
 from ..utils.logger import print_log
 
@@ -59,10 +59,9 @@ def get_task_name(path, model):
     else: raise NotImplementedError(f'model {model} get_task_name not implemented')
 
 
-@ray.remote(num_cpus=4, num_gpus=1)
-def run(task: Task):
+def _run_core(task: Task, gpu_ids: list):
     start = time.time()
-    gpu_ids = [str(i) for i in ray.get_gpu_ids()]
+    gpu_ids = [str(i) for i in gpu_ids]
     input_json = os.path.abspath(task.input_json)
     out_dir = os.path.abspath(task.output_dir)
     if task.model == 'AF3': cmd = af3_cmd(gpu_ids, input_json, out_dir)
@@ -99,7 +98,12 @@ def run(task: Task):
     return task
 
 
-def form_task(json_path, model):
+@ray.remote(num_cpus=4, num_gpus=1)
+def run(task: Task):
+    return _run_core(task, ray.get_gpu_ids())
+
+
+def form_task(json_path, model, remote=True):
     parent_dir = os.path.dirname(json_path)
     name = get_task_name(json_path, model)
     status_file = os.path.join(parent_dir, 'logs', name, '_STATUS')
@@ -108,14 +112,15 @@ def form_task(json_path, model):
         os.makedirs(os.path.join(parent_dir, 'logs', name), exist_ok=True)
         with open(status_file, 'w') as fout: fout.write('ADDED\n')
     os.makedirs(os.path.join(parent_dir, 'output'))
-    task = run.remote(Task(
+    task = Task(
         id=json_path,
         input_json=json_path,
         log_dir=os.path.join(parent_dir, 'logs'),
         output_dir=os.path.join(parent_dir, 'output'),
         status_file=status_file,
         model=model
-    ))
+    )
+    if remote: task = run.remote(task)
     print_log(f'task {json_path} added')
     return task
 
@@ -190,6 +195,27 @@ def scan_tasks(dir, visited, model, chain2msa_paths):
     return tasks
 
 
+def run_metrics(task: Task):
+    candidate_dir = os.path.abspath(os.path.join(os.path.dirname(task.input_json), '..'))
+    prefix, n = os.path.split(candidate_dir)
+    prefix, rname = os.path.split(prefix)
+    history_file = os.path.join(prefix, 'history.json')
+    gen_seq = json.load(open(history_file, 'r'))[f'{rname}_{n}'][0]
+    lig_chains = list(gen_seq.keys())
+    all_seqs = json.load(open(task.input_json, 'r'))['sequences']
+    tgt_chains = []
+    for item in all_seqs:
+        if 'protein' not in item: continue
+        chain = item['protein']['id']
+        if chain not in gen_seq: tgt_chains.append(chain)
+    chain2index = { c: i for i, c in enumerate(sorted(tgt_chains + lig_chains)) }
+    iptm_row_cols = []
+    for c1 in tgt_chains:
+        for c2 in lig_chains: iptm_row_cols.append([chain2index[c1], chain2index[c2]])
+    metrics = load_af3_metrics(candidate_dir, tgt_chains, lig_chains, iptm_row_cols)
+    return metrics
+
+
 def main(args):
     ray.init()
     print_log('Ray initialized')
@@ -216,6 +242,7 @@ def main(args):
                 for done_id in done_ids:
                     task = ray.get(done_id)
                     print_log(f'{task.id} finished. Elapsed {round(task.elapsed_time, 2)}s. Exit code: {task.exit_code}.')
+                    print_log(f'{task.id} metrics: {run_metrics(task)}')
                     sys.stdout.flush()
                     finish_cnt += 1
             if len(futures) == 0:

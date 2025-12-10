@@ -12,7 +12,7 @@ import torch
 
 from .constructor import construct_input_json
 from .af3_utils import get_scRMSD
-from .struct_server import form_task
+from .struct_server import form_task, _run_core
 from ..utils.logger import print_log
 
 
@@ -35,14 +35,18 @@ def _run_af3(config_path, template_dir, template_history, chain2msa_paths, out_d
         n_seeds=5   # stable results
     )
     # run task with ray
-    task = form_task(os.path.join(out_dir, 'AF3.json'), 'AF3')
-    futures = [task]
-    while len(futures) > 0:
-        done_ids, futures = ray.wait(futures, num_returns=1, timeout=1)
-        if len(done_ids) == 0: time.sleep(10)   # not any tasks finished yet
-        for done_id in done_ids:
-            task = ray.get(done_id)
-            print_log(f'{task.id} finished. Elapsed {round(task.elapsed_time, 2)}s. Exit code: {task.exit_code}.')
+    task = form_task(os.path.join(out_dir, 'AF3.json'), 'AF3', remote=False)
+    task = _run_core(task, [torch.cuda.current_device()])
+    print_log(f'{task.id} finished. Elapsed {round(task.elapsed_time, 2)}s. Exit code: {task.exit_code}.')
+
+    # task = form_task(os.path.join(out_dir, 'AF3.json'), 'AF3')
+    # futures = [task]
+    # while len(futures) > 0:
+    #     done_ids, futures = ray.wait(futures, num_returns=1, timeout=1)
+    #     if len(done_ids) == 0: time.sleep(10)   # not any tasks finished yet
+    #     for done_id in done_ids:
+    #         task = ray.get(done_id)
+    #         print_log(f'{task.id} finished. Elapsed {round(task.elapsed_time, 2)}s. Exit code: {task.exit_code}.')
 
 
 def af3_rectification(sorted_history, history_configs, topk, root_dir, msa_config=None):
