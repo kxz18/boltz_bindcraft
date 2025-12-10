@@ -112,7 +112,33 @@ class pAE(Objective):
     def __call__(self, dict_out, feats, cplx_info: ComplexInfo):
         pae = dict_out['pae'].mean()
         return pae, round(pae.item(), 3)
-    
+
+
+@R.register('ipAE')
+class ipAE(Objective):
+    '''
+        Interface pAE between given chains
+    '''
+    def __init__(self, chain_pairs):
+        super().__init__()
+        self.chain_pairs = chain_pairs
+
+    def __call__(self, dict_out, feats, cplx_info):
+        ipaes = []
+        pae = dict_out['pae'][0] / 31.0
+        pae =(pae + pae.T) / 2
+        c2masks = {}
+        for c in cplx_info.chain_ids:
+            if c in c2masks: continue
+            mask = [True if c2 == c else False for c2 in cplx_info.chain_ids]
+            c2masks[c] = torch.tensor(mask, dtype=bool, device=pae.device)
+        mask = None
+        for c1, c2 in self.chain_pairs:
+            mask1, mask2 = c2masks[c1], c2masks[c2]
+            ipaes.append(pae[mask1[:, None] & mask2[None, :]].mean())
+        ipae = sum(ipaes) / len(ipaes)
+        return ipae, round(ipae.item() * 31.0, 2)
+
 
 @R.register('ipDE')
 class ipDE(Objective):
