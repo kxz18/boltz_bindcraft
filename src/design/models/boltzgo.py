@@ -137,13 +137,13 @@ class BoltzGOConfig:
     epitope_loss_threshold: float = 15.0                # within average of 15A distance from epitope to nearest k residues on the generated part (center to center)
     max_inner_steps: int = 10
     max_outer_steps: int = 100
-    inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2 (default is 3)
-    inner_diffusion_steps: Optional[int] = None         # if none, use the default in Boltz2
+    inner_enc_recycling_steps: Optional[int] = 1        # if none use the default in Boltz2 (default is 3)
+    inner_diffusion_steps: Optional[int] = 100          # if none, use the default in Boltz2 (default is 200)
     maintain_logits: bool = False                       # whether to keep the logits between outer loops. if true, the optimizer and the logits will be maintained. not recommended to be true as it easily leads to stuck in local optima
-    use_history_best: bool = False                      # whether to use history best as starters for each outer loops
-    history_best_topk: int = 1                          # random sample from topk best in history for outer loops
+    use_history_best: bool = True                       # whether to use history best as starters for each outer loops
+    history_best_topk: int = 3                          # random sample from topk best in history for outer loops
     fix_inner_loop_seed: bool = True                    # whether to fix the seed for the inner loop (better to fix)
-    inner_loop_best_as_output: bool = False
+    inner_loop_best_as_output: bool = True
 
     init_scale: float = 6.0         # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0        # offset for the initial logits
@@ -154,7 +154,7 @@ class BoltzGOConfig:
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
 
-    af3_rect_freq: int = 0           # using AF3 for rectification of the top sample_k candidates, and select the one with the lowest scRMSD for next round. If set to 0, disable this mechanism
+    af3_rect_freq: int = 1           # using AF3 for rectification of the top sample_k candidates, and select the one with the lowest scRMSD for next round. If set to 0, disable this mechanism
 
     disallow_aas: list = field(default_factory=lambda: ['CYS'])  # do not generate the residues in this list
 
