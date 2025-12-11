@@ -56,6 +56,16 @@ def loss_to_prob(losses):
     return p
 
 
+def epitope_filter(loss_history, threshold=10.0):
+    passed_history = {}
+    for name in loss_history:
+        loss_details = loss_history[name][1]
+        if ('Epitope' in loss_details) and (loss_details['Epitope'] > threshold):
+            continue
+        passed_history[name] = loss_history[name]
+    return passed_history
+
+
 def run_design(config, out_dir, ckpt_dir, af3_msa_config):
     start = time.time()
     trainer, model_module, data_module, data_updater = prepare_boltz2(
@@ -72,13 +82,6 @@ def run_design(config, out_dir, ckpt_dir, af3_msa_config):
     model_module.set_mode_generation(True)
     print_log(f'Preparation elapsed {time.time() - start}s')
     if trainer is None: return
-
-    # if model_module.generator_config.af3_rect_freq > 0:
-    #     ray.init(
-    #         include_dashboard=False,
-    #         logging_level='error',
-    #         ignore_reinit_error=True,
-    #     )
 
     name = os.path.splitext(os.path.basename(config))[0]
 
@@ -148,15 +151,21 @@ def run_design(config, out_dir, ckpt_dir, af3_msa_config):
         if patience <= 0:
             print_log(f'Algorithm converged. Early stop.')
             break
+        epi_filtered_history = epitope_filter({ history_name: history[history_name] for history_name in topk_history }, model_module.generator_config.epitope_loss_threshold)
+        if (rnd > model_module.generator_config.epitope_early_stop_patience) and (len(epi_filtered_history) == 0):
+            print_log(f'This trajectory fails to converge to the specified epitope. Early stop.')
+            break
 
         # use the best one for next round
         config_path = os.path.join(config_dir, f'round{rnd}.yaml')
         af3_rect_freq = model_module.generator_config.af3_rect_freq
-        if (af3_rect_freq > 0) and (rnd > 0) and (rnd % af3_rect_freq == 0):
+        if (len(epi_filtered_history) == 0) and (af3_rect_freq > 0): print_log(f'No candidate passed epitope filter in top {len(topk_history)}, so AF3 rectification will not start.')
+        if (af3_rect_freq > 0) and (rnd > 0) and (rnd % af3_rect_freq == 0) and (len(epi_filtered_history) > 0):
             # AF3 rectification
             print_log(f'Round {rnd}, entering AF3 orthogonal rectification')
+            print_log(f'Selecting from candidates that passed epitope filter: {list(epi_filtered_history.keys())}')
             rect_topk = model_module.generator_config.sample_k
-            sel_name, scrmsd = af3_rectification(history, history_configs, rect_topk, out_dir, af3_msa_config)
+            sel_name, scrmsd = af3_rectification(epi_filtered_history, history_configs, rect_topk, out_dir, af3_msa_config)
             os.system(f'cp {history_configs[sel_name]} {config_path}')
             print_log(f'Using {sel_name}, the one with best scRMSD ({round(scrmsd, 2)}) among top-{rect_topk} for the next round')
         elif model_module.generator_config.use_history_best:

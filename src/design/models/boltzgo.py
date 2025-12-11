@@ -132,6 +132,9 @@ class InputEmbedderWrapper(nn.Module):
 class BoltzGOConfig:
     lr: float = 1.0
     converge_patience: int = 5                          # how many steps not updating the history_best_topk list can we tolerate?
+    epitope_early_stop_patience: int = 10               # how many steps to tolerate if the epitope is still far away from the specified one 
+                                                        # (usually within 10 rounds the epitope distance should be less than 10A, otherwise the trajectory is likely to fail)
+    epitope_loss_threshold: float = 10.0                # within average of 10A distance from epitope to nearest k residues on the generated part
     max_inner_steps: int = 10
     max_outer_steps: int = 100
     inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2 (default is 3)
@@ -150,7 +153,7 @@ class BoltzGOConfig:
     sample_k: int = 5           # number of samples for discretization
     sample_method: str = 'multinomial'
 
-    af3_rect_freq: int = 0      # using AF3 for rectification of the top sample_k candidates, and select the one with the lowest scRMSD for next round. If set to 0, disable this mechanism
+    af3_rect_freq: int = 0           # using AF3 for rectification of the top sample_k candidates, and select the one with the lowest scRMSD for next round. If set to 0, disable this mechanism
 
     disallow_aas: list = field(default_factory=lambda: ['CYS'])  # do not generate the residues in this list
 
