@@ -134,7 +134,7 @@ class BoltzGOConfig:
     converge_patience: int = 5                          # how many steps not updating the history_best_topk list can we tolerate?
     epitope_early_stop_patience: int = 10               # how many steps to tolerate if the epitope is still far away from the specified one 
                                                         # (usually within 10 rounds the epitope distance should be less than 10A, otherwise the trajectory is likely to fail)
-    epitope_loss_threshold: float = 10.0                # within average of 10A distance from epitope to nearest k residues on the generated part
+    epitope_loss_threshold: float = 15.0                # within average of 15A distance from epitope to nearest k residues on the generated part (center to center)
     max_inner_steps: int = 10
     max_outer_steps: int = 100
     inner_enc_recycling_steps: Optional[int] = None     # if none use the default in Boltz2 (default is 3)
@@ -147,6 +147,7 @@ class BoltzGOConfig:
 
     init_scale: float = 6.0         # scale for the initial logits (one_hot * scale - offset for the softmax)
     init_offset: float = 3.0        # offset for the initial logits
+    init_random: bool = True        # whether to use randomized initialization or from the given one
     x_grad_scale: float = 1000.0    # gradient concerning structures will decay during backprop through diffusion, so we need to enlarge it
     final_grad_rescale_factor: float = 1.0 # g = g * factor. it's better to control the grad norm between 1e-1 and 1e-2
 
@@ -235,19 +236,24 @@ class BoltzGO(Boltz2):  # boltz with gradient optimization
     def _initialize(self, batch):
         if self.generator_config.maintain_logits:
             if self.outer_loop_count == 0: # the initial round
-                print_log(f'Initialize maintained logits from Gaussian')
                 res_type = batch['res_type'].detach().float().requires_grad_(True)
-                res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
+                if self.generator_config.init_random:
+                    print_log(f'Initialize maintained logits from Gaussian')
+                    res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
+                else:
+                    print_log(f'Initialize maintained logits from the given start point')
+                    res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
                 optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
                 self._res_type, self._optimizer = res_type, optimizer
             else: res_type, optimizer = self._res_type, self._optimizer
         else:   # start from the discretized state
             res_type = batch['res_type'].detach().float().requires_grad_(True)
             with torch.no_grad():
-                if self.outer_loop_count == 0:  # the initial round
+                if (self.outer_loop_count == 0) and self.generator_config.init_random:  # the initial round
                     print_log(f'Initialize residue logits from Gaussian')
                     res_type[self.masks] = torch.randn_like(res_type[self.masks]) * self.generator_config.init_offset # random initialization
                 else:
+                    if self.outer_loop_count == 0: print_log(f'Initialize residue logits from the given start point')
                     res_type[self.masks] = res_type[self.masks] * self.generator_config.init_scale - self.generator_config.init_offset # project one-hot to larger scale as logits
             optimizer = torch.optim.AdamW([res_type], lr=self.generator_config.lr)
         return res_type, optimizer  # logits and optimizer
